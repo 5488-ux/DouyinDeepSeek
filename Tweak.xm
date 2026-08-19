@@ -1,7 +1,6 @@
 #import <UIKit/UIKit.h>
 #import <Foundation/Foundation.h>
 #import <objc/runtime.h>
-#import <substrate.h>
 
 #import "Sources/DSConfig.h"
 #import "Sources/DSDeepSeekClient.h"
@@ -10,6 +9,21 @@
 
 static const NSInteger DSSettingsButtonTag = 0x44534149;
 static const void *DSSettingsInjectedKey = &DSSettingsInjectedKey;
+
+static BOOL DSHookInstanceMethod(Class targetClass, SEL selector, IMP replacement, IMP *original) {
+    if (!targetClass || !selector || !replacement) return NO;
+    Method method = class_getInstanceMethod(targetClass, selector);
+    if (!method) return NO;
+
+    IMP previous = method_getImplementation(method);
+    const char *types = method_getTypeEncoding(method);
+    if (!class_addMethod(targetClass, selector, replacement, types)) {
+        Method ownMethod = class_getInstanceMethod(targetClass, selector);
+        previous = method_setImplementation(ownMethod, replacement);
+    }
+    if (original) *original = previous;
+    return previous != NULL;
+}
 
 @interface DSAutoReplyEngine : NSObject
 + (instancetype)shared;
@@ -220,8 +234,7 @@ static void DSInstallHooks(void) {
         class_addMethod(settingsClass, NSSelectorFromString(@"ds_openDeepSeekSettings"), (IMP)DSOpenSettings, "v@:");
         Method method = class_getInstanceMethod(settingsClass, @selector(viewDidAppear:));
         if (method) {
-            MSHookMessageEx(settingsClass, @selector(viewDidAppear:), (IMP)DSNewSettingsViewDidAppear, (IMP *)&DSOldSettingsViewDidAppear);
-            DSSettingsHooked = YES;
+            DSSettingsHooked = DSHookInstanceMethod(settingsClass, @selector(viewDidAppear:), (IMP)DSNewSettingsViewDidAppear, (IMP *)&DSOldSettingsViewDidAppear);
         }
     }
 
@@ -229,16 +242,14 @@ static void DSInstallHooks(void) {
     if (messageClass && !DSMessageHooked) {
         Method method = class_getInstanceMethod(messageClass, @selector(viewDidAppear:));
         if (method) {
-            MSHookMessageEx(messageClass, @selector(viewDidAppear:), (IMP)DSNewMessageViewDidAppear, (IMP *)&DSOldMessageViewDidAppear);
-            DSMessageHooked = YES;
+            DSMessageHooked = DSHookInstanceMethod(messageClass, @selector(viewDidAppear:), (IMP)DSNewMessageViewDidAppear, (IMP *)&DSOldMessageViewDidAppear);
         }
     }
     if (messageClass && !DSReloadHooked) {
         SEL selector = NSSelectorFromString(@"vm_afterReloadData");
         Method method = class_getInstanceMethod(messageClass, selector);
         if (method) {
-            MSHookMessageEx(messageClass, selector, (IMP)DSNewAfterReloadData, (IMP *)&DSOldAfterReloadData);
-            DSReloadHooked = YES;
+            DSReloadHooked = DSHookInstanceMethod(messageClass, selector, (IMP)DSNewAfterReloadData, (IMP *)&DSOldAfterReloadData);
         }
     }
 
@@ -247,8 +258,7 @@ static void DSInstallHooks(void) {
         SEL selector = NSSelectorFromString(@"initWithIMUser:");
         Method method = class_getInstanceMethod(friendClass, selector);
         if (method) {
-            MSHookMessageEx(friendClass, selector, (IMP)DSNewFriendInit, (IMP *)&DSOldFriendInit);
-            DSFriendHooked = YES;
+            DSFriendHooked = DSHookInstanceMethod(friendClass, selector, (IMP)DSNewFriendInit, (IMP *)&DSOldFriendInit);
         }
     }
 }

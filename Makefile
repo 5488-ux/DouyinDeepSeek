@@ -15,7 +15,6 @@ DouyinDeepSeek_FILES = Tweak.xm \
 DouyinDeepSeek_CFLAGS = -fobjc-arc -Wno-deprecated-declarations -Wno-unused-function
 DouyinDeepSeek_CCFLAGS = -std=c++17
 DouyinDeepSeek_FRAMEWORKS = UIKit Foundation Security
-DouyinDeepSeek_LIBRARIES = substrate
 
 INSTALL_TARGET_PROCESSES = Aweme
 

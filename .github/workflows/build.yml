@@ -20,12 +20,13 @@ jobs:
 
       - name: Build rootless and rootful packages
         run: |
-          mkdir -p artifact/rootless artifact/rootful
+          mkdir -p artifact/rootless artifact/rootful artifact/fullsign
           make clean package FINALPACKAGE=1 THEOS_PACKAGE_SCHEME=rootless
           cp packages/*.deb artifact/rootless/
           rm -f packages/*.deb
           make clean package FINALPACKAGE=1 THEOS_PACKAGE_SCHEME=
           cp packages/*.deb artifact/rootful/
+          cp .theos/obj/DouyinDeepSeek.dylib artifact/fullsign/DouyinDeepSeek-AllSign.dylib
 
       - name: Upload rootless package
         uses: actions/upload-artifact@v7
@@ -39,4 +40,11 @@ jobs:
         with:
           name: DouyinDeepSeek-rootful
           path: artifact/rootful/*.deb
+          if-no-files-found: error
+
+      - name: Upload AllSign dylib
+        uses: actions/upload-artifact@v7
+        with:
+          name: DouyinDeepSeek-AllSign
+          path: artifact/fullsign/DouyinDeepSeek-AllSign.dylib
           if-no-files-found: error

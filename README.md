@@ -17,7 +17,8 @@
 - 生成或冷却期间到达的新消息会保留为待处理消息，不再提前吞掉。
 - 发信链路按参考插件使用 `AWEIMShareMessageCreater.sharedInstance` 和 `AWEIMSendMessageController.sharedInstance`。
 - 工程面向抖音这种普通 App Store App 只编译 `arm64`，避免 Linux 云工具链产出带不兼容 ABI 警告的 `arm64e` slice。
-- 同时云编译 rootless 与 rootful 两种 `.deb`。
+- Hook 使用 Objective-C Runtime，不再链接 `CydiaSubstrate`，可供全能签直接注入 IPA。
+- 同时云编译 rootless、rootful 两种 `.deb` 和全能签裸 `.dylib`。
 
 ## 参考 dylib 得到的兼容点
 
@@ -42,6 +43,7 @@
 3. 构建完成后下载：
    - `DouyinDeepSeek-rootless`：Dopamine、无根越狱等环境。
    - `DouyinDeepSeek-rootful`：传统 rootful 环境。
+   - `DouyinDeepSeek-AllSign`：解压后把 `DouyinDeepSeek-AllSign.dylib` 注入抖音 IPA，再签名安装。
 4. 用 Sileo、Zebra、Filza 或 `dpkg -i` 安装 `.deb`，然后彻底结束并重开抖音。
 5. 进入抖音设置页，点右上角脑袋图标（旧系统显示 `AI`）。
 6. 填写 API Key，先点“测试 DeepSeek API”。
