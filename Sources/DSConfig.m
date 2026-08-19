@@ -25,7 +25,7 @@ static NSString * const DSKeychainAccount = @"api-key";
         [DSDefaultsPrefix stringByAppendingString:@"systemPrompt"]: @"你正在代替我回复抖音私信。请结合完整上下文自然、简洁地回答，保持我的口吻，不要提到自己是AI，不要编造上下文里没有的事实。只输出要发送的回复正文。",
         [DSDefaultsPrefix stringByAppendingString:@"contextLimit"]: @20,
         [DSDefaultsPrefix stringByAppendingString:@"cooldown"]: @15,
-        [DSDefaultsPrefix stringByAppendingString:@"maxReplyTokens"]: @300,
+        [DSDefaultsPrefix stringByAppendingString:@"maxReplyTokens"]: @1024,
         [DSDefaultsPrefix stringByAppendingString:@"thinkingEnabled"]: @NO,
     }];
 }
@@ -96,4 +96,3 @@ static NSString * const DSKeychainAccount = @"api-key";
 }
 
 @end
-
