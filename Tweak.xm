@@ -36,7 +36,10 @@ static void DSEnsureSettingsOriginals(void) {
 static IMP DSOriginalSettingsViewDidAppear(Class targetClass) {
     DSEnsureSettingsOriginals();
     @synchronized (DSSettingsOriginalImplementations) {
-        return [[DSSettingsOriginalImplementations objectForKey:targetClass] pointerValue];
+        NSValue *value = [DSSettingsOriginalImplementations objectForKey:targetClass];
+        IMP implementation = NULL;
+        if (value) [value getValue:&implementation];
+        return implementation;
     }
 }
 
@@ -62,7 +65,7 @@ static BOOL DSInstallSettingsHookForClass(Class targetClass) {
     IMP original = NULL;
     if (!DSHookInstanceMethod(targetClass, @selector(viewDidAppear:), (IMP)DSNewSettingsViewDidAppear, &original)) return NO;
     @synchronized (DSSettingsOriginalImplementations) {
-        [DSSettingsOriginalImplementations setObject:[NSValue valueWithPointer:original] forKey:targetClass];
+        [DSSettingsOriginalImplementations setObject:[NSValue valueWithBytes:&original objCType:@encode(IMP)] forKey:targetClass];
     }
     return YES;
 }

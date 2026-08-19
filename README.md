@@ -5,6 +5,7 @@
 ## 已实现
 
 - 抖音设置页右上角增加 DeepSeek 入口。
+- 设置入口会扫描当前版本实际加载的 `AWE*Setting*ViewController`，不再只依赖单个写死类名。
 - 总开关，可随时关闭自动回复。
 - DeepSeek API Key 使用 iOS Keychain 保存，不写进源码、GitHub 或偏好 plist。
 - API 地址、模型、思考模式、最大回复 Token 可配置。
