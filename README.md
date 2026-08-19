@@ -1,5 +1,11 @@
 # DouyinDeepSeek
 
+## 0.2.0
+
+- 删除真机证明会静默空转的 `AWEIMMessageListViewController sendMessage:` 路线。
+- 固定使用 `AWEIMSendMessageController + TIMXOConversation` 真实 SDK 发信链。
+- 发信后轮询会话新增消息；只有生成文本真实出现在会话中才报告成功，否则自动切换 Yuki 再试并继续验证。
+
 ## 0.1.9
 
 - 根据 39.9.0 真机报错修复：会话列表给出的是 `AWEIMMessageConversation` UI 包装对象，现在自动解包其 `con` 后再交给 SDK 发信器。

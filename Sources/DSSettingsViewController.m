@@ -237,8 +237,8 @@ typedef NS_ENUM(NSInteger, DSSettingsSection) {
         }
         [[DSRuntimeBridge shared] sendText:reply toConversation:conversation completion:^(BOOL success, NSError *sendError) {
             [self setBusy:NO title:nil];
-            NSString *title = success ? @"已提交给抖音发信接口" : @"生成成功，但发信接口调用失败";
-            NSString *message = success ? [NSString stringWithFormat:@"目标：%@\n\n%@\n\n请返回聊天确认消息是否真实送达。", conversation.displayName, reply] : [NSString stringWithFormat:@"已生成：%@\n\n发信错误：%@\n\n点下面的“复制报错”，把完整内容发给开发者。", reply, sendError.localizedDescription];
+            NSString *title = success ? @"已确认消息出现在会话中" : @"生成成功，但真实发信失败";
+            NSString *message = success ? [NSString stringWithFormat:@"目标：%@\n\n%@", conversation.displayName, reply] : [NSString stringWithFormat:@"已生成：%@\n\n发信错误：%@\n\n点下面的“复制报错”，把完整内容发给开发者。", reply, sendError.localizedDescription];
             NSString *report = success ? nil : [[DSRuntimeBridge shared] diagnosticReportForConversation:conversation];
             [self showResultTitle:title message:message copyText:report];
         }];

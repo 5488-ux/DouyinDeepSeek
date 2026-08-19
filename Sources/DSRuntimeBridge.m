@@ -536,6 +536,85 @@ static id DSUnwrappedConversation(id conversation) {
     }
 }
 
+- (NSSet<NSString *> *)messageIDsForConversationID:(NSString *)conversationID {
+    NSMutableSet<NSString *> *messageIDs = [NSMutableSet set];
+    @synchronized (self.conversations) {
+        DSConversationSnapshot *snapshot = self.conversations[conversationID];
+        for (DSMessageSnapshot *message in snapshot.messages) {
+            if (message.messageID.length) [messageIDs addObject:message.messageID];
+        }
+    }
+    return messageIDs;
+}
+
+- (void)waitForSentText:(NSString *)text
+          conversationID:(NSString *)conversationID
+       baselineMessageIDs:(NSSet<NSString *> *)baselineMessageIDs
+         remainingChecks:(NSInteger)remainingChecks
+              completion:(void (^)(BOOL confirmed))completion {
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(800 * NSEC_PER_MSEC)), dispatch_get_main_queue(), ^{
+        __block DSMessageSnapshot *matched = nil;
+        @synchronized (self.conversations) {
+            DSConversationSnapshot *snapshot = self.conversations[conversationID];
+            for (DSMessageSnapshot *message in snapshot.messages.reverseObjectEnumerator) {
+                BOOL isNew = !message.messageID.length || ![baselineMessageIDs containsObject:message.messageID];
+                if (isNew && [message.text isEqualToString:text]) {
+                    matched = message;
+                    break;
+                }
+            }
+        }
+        if (matched) {
+            [self recordDiagnostic:[NSString stringWithFormat:@"真实发信确认：messageID=%@ outgoing=%@",
+                                    matched.messageID ?: @"nil", matched.outgoing ? @"✓" : @"✗"]];
+            completion(YES);
+            return;
+        }
+        if (remainingChecks > 1) {
+            [self waitForSentText:text
+                  conversationID:conversationID
+               baselineMessageIDs:baselineMessageIDs
+                 remainingChecks:remainingChecks - 1
+                      completion:completion];
+            return;
+        }
+        [self recordDiagnostic:@"真实发信确认失败：6.4 秒内会话中没有出现生成文本"];
+        completion(NO);
+    });
+}
+
+- (void)attemptYukiSendText:(NSString *)text
+              conversationID:(NSString *)conversationID
+           baselineMessageIDs:(NSSet<NSString *> *)baselineMessageIDs
+                   diagnostic:(NSString *)diagnostic
+                   completion:(DSSendCompletion)completion {
+    BOOL invoked = [self sendTextThroughYukiIfAvailable:text
+                                         conversationID:conversationID
+                                             diagnostic:diagnostic
+                                             completion:^(BOOL success, NSError *error) {
+        if (!success) {
+            completion(NO, error);
+            return;
+        }
+        [self waitForSentText:text
+               conversationID:conversationID
+            baselineMessageIDs:baselineMessageIDs
+              remainingChecks:8
+                   completion:^(BOOL confirmed) {
+            if (confirmed) {
+                completion(YES, nil);
+            } else {
+                NSString *message = @"Yuki 返回成功，但消息仍未出现在会话中，已拒绝伪报成功。";
+                completion(NO, [NSError errorWithDomain:DSBridgeErrorDomain code:-6 userInfo:@{NSLocalizedDescriptionKey: message}]);
+            }
+        }];
+    }];
+    if (!invoked) {
+        NSString *message = [NSString stringWithFormat:@"原生发信未确认（%@），Yuki 发信链也不可调用。", diagnostic];
+        completion(NO, [NSError errorWithDomain:DSBridgeErrorDomain code:-2 userInfo:@{NSLocalizedDescriptionKey: message}]);
+    }
+}
+
 - (void)sendText:(NSString *)text toConversation:(DSConversationSnapshot *)conversation completion:(DSSendCompletion)completion {
     if (!text.length || !conversation.conversationID.length) {
         [self recordDiagnostic:[NSString stringWithFormat:@"发送入口拒绝：text=%lu cid=%@",
@@ -544,88 +623,54 @@ static id DSUnwrappedConversation(id conversation) {
         return;
     }
 
-    id controller = conversation.controller;
-    id messageObject = [self messageObjectForText:text];
-    [self recordDiagnostic:[NSString stringWithFormat:@"开始发送：cid=%@ 文本=%lu controller=%@ conversation=%@ message=%@",
-                            conversation.conversationID,
+    NSString *conversationID = conversation.conversationID;
+    NSSet<NSString *> *baselineMessageIDs = [self messageIDsForConversationID:conversationID];
+    [self recordDiagnostic:[NSString stringWithFormat:@"开始真实发送：cid=%@ 文本=%lu controller=%@ storedConversation=%@ baseline=%lu",
+                            conversationID,
                             (unsigned long)text.length,
-                            controller ? NSStringFromClass([controller class]) : @"nil",
+                            conversation.controller ? NSStringFromClass([conversation.controller class]) : @"nil",
                             conversation.conversationObject ? NSStringFromClass([conversation.conversationObject class]) : @"nil",
-                            messageObject ? NSStringFromClass([messageObject class]) : @"nil"]];
-    SEL directSelector = NSSelectorFromString(@"sendMessage:");
-    if (controller && messageObject && [controller respondsToSelector:directSelector]) {
-        @try {
-            [self recordDiagnostic:[NSString stringWithFormat:@"尝试控制器直发：%@ %@",
-                                    NSStringFromClass([controller class]), NSStringFromSelector(directSelector)]];
-            ((void (*)(id, SEL, id))objc_msgSend)(controller, directSelector, messageObject);
-            self.recentOutgoingTexts[conversation.conversationID] = text;
-            self.recentOutgoingDates[conversation.conversationID] = NSDate.date;
-            [self recordDiagnostic:@"控制器直发已返回"];
-            completion(YES, nil);
+                            (unsigned long)baselineMessageIDs.count]];
+    [self recordDiagnostic:@"已禁用会静默空转的 AWEIMMessageListViewController sendMessage: 路线"];
+
+    [self fetchConversation:conversationID completion:^(id fetchedConversation) {
+        id sdkConversation = DSUnwrappedConversation(fetchedConversation ?: conversation.conversationObject);
+        if (sdkConversation) conversation.conversationObject = sdkConversation;
+        id sender = DSSharedInstanceForClass(objc_getClass("AWEIMSendMessageController"));
+        BOOL invoked = [self invokeSendController:sender text:text conversation:sdkConversation];
+        NSString *diagnostic = [NSString stringWithFormat:@"SDK会话=%@，发信器=%@，原生调用=%@",
+                                sdkConversation ? NSStringFromClass([sdkConversation class]) : @"nil",
+                                sender ? NSStringFromClass([sender class]) : @"nil",
+                                invoked ? @"✓" : @"✗"];
+        if (!invoked) {
+            [self recordDiagnostic:[NSString stringWithFormat:@"原生发信未调用成功：%@，转 Yuki", diagnostic]];
+            [self attemptYukiSendText:text
+                        conversationID:conversationID
+                     baselineMessageIDs:baselineMessageIDs
+                             diagnostic:diagnostic
+                             completion:completion];
             return;
-        } @catch (NSException *exception) {
-            [self recordDiagnostic:[NSString stringWithFormat:@"控制器直发异常：%@ / %@", exception.name, exception.reason ?: @"无原因"]];
         }
-    } else {
-        [self recordDiagnostic:[NSString stringWithFormat:@"跳过控制器直发：controller=%@ message=%@ selector=%@",
-                                controller ? @"✓" : @"✗",
-                                messageObject ? @"✓" : @"✗",
-                                [controller respondsToSelector:directSelector] ? @"✓" : @"✗"]];
-    }
 
-    id sendController = DSSafeValue(controller, @[@"sendMessageController", @"inputViewController.sendMessageController", @"messageViewModel.sendMessageController"]);
-    if (!sendController) sendController = DSSharedInstanceForClass(objc_getClass("AWEIMSendMessageController"));
-    id rawConversationObject = conversation.conversationObject ?: DSSafeValue(controller, @[@"msg_conversation", @"currentConversation", @"conversation"]);
-    id conversationObject = DSUnwrappedConversation(rawConversationObject);
-    if (rawConversationObject && rawConversationObject != conversationObject) {
-        [self recordDiagnostic:[NSString stringWithFormat:@"解包会话对象：%@ -> %@",
-                                NSStringFromClass([rawConversationObject class]), NSStringFromClass([conversationObject class])]];
-        conversation.conversationObject = conversationObject;
-    }
-    if ([self invokeSendController:sendController text:text conversation:conversationObject]) {
-        self.recentOutgoingTexts[conversation.conversationID] = text;
-        self.recentOutgoingDates[conversation.conversationID] = NSDate.date;
-        [self recordDiagnostic:@"当前会话发信器调用已返回"];
-        completion(YES, nil);
-        return;
-    }
-
-    [self recordDiagnostic:[NSString stringWithFormat:@"当前会话发信器失败，开始重新取会话：sender=%@ conversation=%@",
-                            sendController ? NSStringFromClass([sendController class]) : @"nil",
-                            conversationObject ? NSStringFromClass([conversationObject class]) : @"nil"]];
-
-    [self fetchConversation:conversation.conversationID completion:^(id fetchedConversation) {
-        fetchedConversation = DSUnwrappedConversation(fetchedConversation);
-        if (fetchedConversation) conversation.conversationObject = fetchedConversation;
-        Class senderClass = objc_getClass("AWEIMSendMessageController");
-        id sender = DSSharedInstanceForClass(senderClass);
-        BOOL sent = [self invokeSendController:sender text:text conversation:fetchedConversation];
-        if (sent) {
-            self.recentOutgoingTexts[conversation.conversationID] = text;
-            self.recentOutgoingDates[conversation.conversationID] = NSDate.date;
-            [self recordDiagnostic:@"重新取会话后的原生发信调用已返回"];
-            completion(YES, nil);
-        } else {
-            Class creatorClass = objc_getClass("AWEIMShareMessageCreater");
-            id creator = DSSharedInstanceForClass(creatorClass);
-            BOOL creatorReady = creator && [creator respondsToSelector:NSSelectorFromString(@"sendTextMessageWithContent:")];
-            BOOL senderReady = sender && ([sender respondsToSelector:NSSelectorFromString(@"sendMessage:conversation:forwardMessage:mentionUsers:")] ||
-                                          [sender respondsToSelector:NSSelectorFromString(@"sendMessage:conversation:forwardMessage:mentionUsers:enterFrom:")] ||
-                                          [sender respondsToSelector:NSSelectorFromString(@"sendMessage:")]);
-            NSString *diagnostic = [NSString stringWithFormat:@"会话对象%@，消息创建器%@，发信器%@",
-                                    fetchedConversation ? @"✓" : @"✗",
-                                    creatorReady ? @"✓" : @"✗",
-                                    senderReady ? @"✓" : @"✗"];
-            [self recordDiagnostic:[NSString stringWithFormat:@"原生发信最终失败：%@", diagnostic]];
-            if ([self sendTextThroughYukiIfAvailable:text
-                                      conversationID:conversation.conversationID
-                                          diagnostic:diagnostic
-                                          completion:completion]) {
+        self.recentOutgoingTexts[conversationID] = text;
+        self.recentOutgoingDates[conversationID] = NSDate.date;
+        [self recordDiagnostic:[NSString stringWithFormat:@"原生发信已调用，等待真实消息出现：%@", diagnostic]];
+        [self waitForSentText:text
+               conversationID:conversationID
+            baselineMessageIDs:baselineMessageIDs
+              remainingChecks:8
+                   completion:^(BOOL confirmed) {
+            if (confirmed) {
+                completion(YES, nil);
                 return;
             }
-            NSString *message = [NSString stringWithFormat:@"原生发信链失败（%@）；未检测到可调用的 Yuki 发信链。请先打开目标聊天，再点一次测试发话。", diagnostic];
-            completion(NO, [NSError errorWithDomain:DSBridgeErrorDomain code:-2 userInfo:@{NSLocalizedDescriptionKey: message}]);
-        }
+            [self recordDiagnostic:@"原生发信无真实确认，转 Yuki 再试一次"];
+            [self attemptYukiSendText:text
+                        conversationID:conversationID
+                     baselineMessageIDs:baselineMessageIDs
+                             diagnostic:diagnostic
+                             completion:completion];
+        }];
     }];
 }
 
@@ -817,7 +862,7 @@ static id DSUnwrappedConversation(id conversation) {
 
     NSMutableString *report = [NSMutableString string];
     [report appendString:@"DouyinDeepSeek 运行报错\n"];
-    [report appendString:@"插件版本：0.1.9\n"];
+    [report appendString:@"插件版本：0.2.0\n"];
     [report appendFormat:@"抖音版本：%@ (%@)\n", appVersion, appBuild];
     [report appendFormat:@"系统：iOS %@ / %@\n", UIDevice.currentDevice.systemVersion, UIDevice.currentDevice.model];
     [report appendFormat:@"兼容性：%@\n", [self compatibilitySummary]];
