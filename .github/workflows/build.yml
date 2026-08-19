@@ -1,0 +1,53 @@
+name: Build DouyinDeepSeek
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths-ignore:
+      - "README.md"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        scheme: [rootless, rootful]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential fakeroot rsync curl perl git libxml2 xz-utils
+
+      - name: Install Theos
+        run: |
+          git clone --recursive --depth=1 https://github.com/theos/theos.git "$GITHUB_WORKSPACE/theos"
+          "$GITHUB_WORKSPACE/theos/bin/install-sdk" 16.5
+
+      - name: Build package
+        env:
+          THEOS: ${{ github.workspace }}/theos
+        run: |
+          if [ "${{ matrix.scheme }}" = "rootless" ]; then
+            make clean package FINALPACKAGE=1 THEOS_PACKAGE_SCHEME=rootless
+          else
+            make clean package FINALPACKAGE=1 THEOS_PACKAGE_SCHEME=
+          fi
+
+      - name: Stage artifact
+        run: |
+          mkdir -p "artifact/${{ matrix.scheme }}"
+          cp packages/*.deb "artifact/${{ matrix.scheme }}/"
+
+      - name: Upload package
+        uses: actions/upload-artifact@v4
+        with:
+          name: DouyinDeepSeek-${{ matrix.scheme }}
+          path: artifact/${{ matrix.scheme }}/*.deb
+          if-no-files-found: error
+
