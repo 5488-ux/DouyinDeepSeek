@@ -39,6 +39,44 @@ static NSString *DSStringValue(id value) {
     return nil;
 }
 
+static NSString *DSTextValue(id value, NSInteger depth) {
+    if (!value || value == NSNull.null || depth > 5) return nil;
+    if ([value isKindOfClass:NSAttributedString.class]) value = [value string];
+    if ([value isKindOfClass:NSData.class]) value = [[NSString alloc] initWithData:value encoding:NSUTF8StringEncoding];
+
+    if ([value isKindOfClass:NSString.class]) {
+        NSString *text = [(NSString *)value stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+        if (!text.length) return nil;
+        if ([text hasPrefix:@"{"] || [text hasPrefix:@"["]) {
+            NSData *data = [text dataUsingEncoding:NSUTF8StringEncoding];
+            id json = data ? [NSJSONSerialization JSONObjectWithData:data options:0 error:nil] : nil;
+            NSString *decoded = DSTextValue(json, depth + 1);
+            if (decoded.length) return decoded;
+        }
+        return text;
+    }
+
+    if ([value isKindOfClass:NSDictionary.class]) {
+        NSDictionary *dictionary = value;
+        for (NSString *key in @[@"text", @"contentText", @"content", @"messageText", @"msg_content", @"value"]) {
+            NSString *text = DSTextValue(dictionary[key], depth + 1);
+            if (text.length) return text;
+        }
+        return nil;
+    }
+
+    if ([value isKindOfClass:NSArray.class]) {
+        NSMutableArray<NSString *> *parts = [NSMutableArray array];
+        for (id item in (NSArray *)value) {
+            NSString *text = DSTextValue(item, depth + 1);
+            if (text.length) [parts addObject:text];
+        }
+        return parts.count ? [parts componentsJoinedByString:@"\n"] : nil;
+    }
+
+    return nil;
+}
+
 static BOOL DSBoolValue(id object, NSArray<NSString *> *names, BOOL *found) {
     for (NSString *name in names) {
         SEL selector = NSSelectorFromString(name);
@@ -79,6 +117,8 @@ static id DSSharedInstanceForClass(Class targetClass) {
 @property (nonatomic, strong) NSMutableDictionary<NSString *, DSConversationSnapshot *> *conversations;
 @property (nonatomic, strong) NSHashTable *friendModels;
 @property (nonatomic, strong) NSHashTable *messageControllers;
+@property (nonatomic, strong) NSMutableDictionary<NSString *, NSString *> *recentOutgoingTexts;
+@property (nonatomic, strong) NSMutableDictionary<NSString *, NSDate *> *recentOutgoingDates;
 @property (nonatomic, strong) dispatch_queue_t stateQueue;
 @end
 
@@ -97,6 +137,8 @@ static id DSSharedInstanceForClass(Class targetClass) {
         _conversations = [NSMutableDictionary dictionary];
         _friendModels = [NSHashTable weakObjectsHashTable];
         _messageControllers = [NSHashTable weakObjectsHashTable];
+        _recentOutgoingTexts = [NSMutableDictionary dictionary];
+        _recentOutgoingDates = [NSMutableDictionary dictionary];
         _stateQueue = dispatch_queue_create("com.codex.douyin.deepseek.bridge", DISPATCH_QUEUE_SERIAL);
     }
     return self;
@@ -135,7 +177,8 @@ static id DSSharedInstanceForClass(Class targetClass) {
     return DSStringValue(DSSafeValue(object, @[
         @"conversationID", @"conversationId", @"conversation.identifier",
         @"conversation.conversationID", @"conversation.conversationId",
-        @"msg_conversationID", @"iesMessage.conversationID"
+        @"msg_conversationID", @"belongingConversationIdentifier",
+        @"iesMessage.conversationID", @"iesMessage.belongingConversationIdentifier"
     ]));
 }
 
@@ -148,17 +191,20 @@ static id DSSharedInstanceForClass(Class targetClass) {
 }
 
 - (NSString *)messageTextFromObject:(id)object {
-    id value = DSSafeValue(object, @[
-        @"text", @"content", @"messageText", @"msg_content", @"messageContent",
-        @"iesMessage.content", @"message.content", @"content.text"
-    ]);
-    if ([value isKindOfClass:NSAttributedString.class]) value = [value string];
-    NSString *text = DSStringValue(value);
+    NSArray<NSString *> *paths = @[
+        @"contentText", @"text", @"messageText", @"getContent", @"content",
+        @"msg_content", @"messageContent", @"rawContentDict",
+        @"iesMessage.contentText", @"iesMessage.content", @"message.content",
+        @"content.text", @"content.contentText"
+    ];
+    NSString *text = nil;
+    for (NSString *path in paths) {
+        text = DSTextValue(DSSafeValue(object, @[path]), 0);
+        if (text.length) break;
+    }
     if (!text.length) {
         id ext = DSSafeValue(object, @[@"localExt", @"ext", @"extra"]);
-        if ([ext isKindOfClass:NSDictionary.class]) {
-            text = DSStringValue(ext[@"text"] ?: ext[@"content"]);
-        }
+        text = DSTextValue(ext, 0);
     }
     return [text stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
 }
@@ -166,19 +212,20 @@ static id DSSharedInstanceForClass(Class targetClass) {
 - (NSString *)messageIDFromObject:(id)object fallback:(NSString *)fallback {
     NSString *messageID = DSStringValue(DSSafeValue(object, @[
         @"messageID", @"messageId", @"msg_id", @"serverMessageID", @"clientMessageID",
-        @"uuid", @"iesMessage.messageID", @"iesMessage.messageId"
+        @"identifier", @"compatibleIdentifier", @"uniqueID", @"uuid",
+        @"iesMessage.messageID", @"iesMessage.messageId", @"iesMessage.identifier"
     ]));
     return messageID.length ? messageID : fallback;
 }
 
 - (BOOL)messageIsOutgoing:(id)object {
     BOOL found = NO;
-    BOOL outgoing = DSBoolValue(object, @[@"isSelf", @"isSendByMe", @"isMine", @"isSelfMessage", @"isFromMe"], &found);
+    BOOL outgoing = DSBoolValue(object, @[@"sendFromMe", @"realSendFromMe", @"sendFromMeOpt", @"isSelf", @"isSendByMe", @"isMine", @"isSelfMessage", @"isFromMe"], &found);
     if (found) return outgoing;
 
     id wrappedMessage = DSSafeValue(object, @[@"iesMessage", @"message", @"timMessage"]);
     if (wrappedMessage && wrappedMessage != object) {
-        outgoing = DSBoolValue(wrappedMessage, @[@"isSelf", @"isSendByMe", @"isMine", @"isSelfMessage", @"isFromMe"], &found);
+        outgoing = DSBoolValue(wrappedMessage, @[@"sendFromMe", @"realSendFromMe", @"sendFromMeOpt", @"isSelf", @"isSendByMe", @"isMine", @"isSelfMessage", @"isFromMe"], &found);
         if (found) return outgoing;
     }
 
@@ -190,22 +237,28 @@ static id DSSharedInstanceForClass(Class targetClass) {
     if ([numeric respondsToSelector:@selector(boolValue)]) return [numeric boolValue];
 
     NSString *senderID = DSStringValue(DSSafeValue(object, @[
-        @"senderID", @"senderId", @"fromUserID", @"fromUserId", @"msg_sender",
+        @"senderID", @"senderId", @"sender", @"fromUid", @"fromUserID", @"fromUserId", @"msg_sender",
         @"sender.uid", @"sender.userID", @"iesMessage.senderID", @"iesMessage.senderId",
-        @"iesMessage.fromUserID", @"iesMessage.sender.uid"
+        @"iesMessage.sender", @"iesMessage.fromUid", @"iesMessage.fromUserID", @"iesMessage.sender.uid"
     ]));
-    Class currentUserClass = objc_getClass("TIMXCurrentUserManager");
-    id currentUserManager = DSSharedInstanceForClass(currentUserClass);
-    id currentUser = DSSafeValue(currentUserManager, @[@"currentUser", @"user", @"currentIMUser"]);
-    NSString *currentUserID = DSStringValue(DSSafeValue(currentUser ?: currentUserManager, @[
-        @"uid", @"userID", @"userId", @"secUid", @"identifier"
+    id sdkInstance = nil;
+    Class instancesClass = objc_getClass("TIMXSDKInstancesManager");
+    SEL instanceSelector = NSSelectorFromString(@"iesim_TIMXSDKInstance");
+    if ([instancesClass respondsToSelector:instanceSelector]) {
+        sdkInstance = ((id (*)(id, SEL))objc_msgSend)(instancesClass, instanceSelector);
+    }
+    NSString *currentUserID = DSStringValue(DSSafeValue(sdkInstance, @[
+        @"context.currentUserManager.currentAccountID", @"context.currentUserImp.userID",
+        @"context.currentUserImp.uid", @"context.userCredential.userID",
+        @"context.userCredential.uid", @"context.currentAccountID"
     ]));
     if (senderID.length && currentUserID.length) return [senderID isEqualToString:currentUserID];
     return NO;
 }
 
 - (NSTimeInterval)messageTimestamp:(id)object fallback:(NSTimeInterval)fallback {
-    id value = DSSafeValue(object, @[@"createTime", @"timestamp", @"msg_createTime", @"serverTime", @"iesMessage.createTime"]);
+    id value = DSSafeValue(object, @[@"createTime", @"modifiedCreateTime", @"createdAt", @"serverCreatedAt", @"timestamp", @"msg_createTime", @"serverTime", @"iesMessage.createTime"]);
+    if ([value isKindOfClass:NSDate.class]) return [(NSDate *)value timeIntervalSince1970];
     if (![value respondsToSelector:@selector(doubleValue)]) return fallback;
     NSTimeInterval timestamp = [value doubleValue];
     if (timestamp > 1000000000000.0) timestamp /= 1000.0;
@@ -216,13 +269,14 @@ static id DSSharedInstanceForClass(Class targetClass) {
     if (!controller) return nil;
     [self trackMessageController:controller];
 
-    id conversation = DSSafeValue(controller, @[@"conversation", @"messageViewModel.conversation", @"viewModel.conversation"]);
+    id conversation = DSSafeValue(controller, @[@"msg_conversation", @"currentConversation", @"conversation", @"listViewModel.conversation", @"messageViewModel.conversation", @"viewModel.conversation"]);
     NSString *conversationID = [self conversationIDFromObject:controller];
     if (!conversationID.length) conversationID = [self conversationIDFromObject:conversation];
 
     NSArray *rawMessages = DSArrayValue(controller, @[
-        @"messages", @"messageViewModel.messages", @"viewModel.messages",
-        @"messageList", @"dataSource.messages", @"messageViewModel.messageList"
+        @"msg_messages", @"messages", @"listViewModel.messages",
+        @"messageViewModel.messages", @"viewModel.messages", @"messageList",
+        @"dataSource.messages", @"messageViewModel.messageList"
     ]);
     if (!rawMessages.count) {
         rawMessages = DSArrayValue(conversation, @[@"messages", @"messageList", @"allMessages"]);
@@ -270,6 +324,90 @@ static id DSSharedInstanceForClass(Class targetClass) {
     return snapshot;
 }
 
+- (id)conversationForID:(NSString *)conversationID inMap:(NSDictionary *)conversationMap {
+    if (!conversationID.length || ![conversationMap isKindOfClass:NSDictionary.class]) return nil;
+    id direct = conversationMap[conversationID];
+    if (direct && direct != NSNull.null) return direct;
+
+    for (id value in conversationMap.allValues) {
+        if ([[self conversationIDFromObject:value] isEqualToString:conversationID]) return value;
+    }
+    return nil;
+}
+
+- (NSArray<DSConversationSnapshot *> *)ingestRawMessages:(NSArray *)rawMessages
+                                  belongingConversationMap:(NSDictionary *)conversationMap {
+    if (![rawMessages isKindOfClass:NSArray.class] || !rawMessages.count) return @[];
+
+    NSMutableSet<NSString *> *changedConversationIDs = [NSMutableSet set];
+    NSTimeInterval now = NSDate.date.timeIntervalSince1970;
+
+    @synchronized (self.conversations) {
+        [rawMessages enumerateObjectsUsingBlock:^(id raw, NSUInteger index, BOOL *stop) {
+            NSString *conversationID = [self conversationIDFromObject:raw];
+            if (!conversationID.length) return;
+
+            NSString *text = [self messageTextFromObject:raw];
+            if (!text.length) return;
+
+            NSString *fallback = [NSString stringWithFormat:@"%@-push-%lu-%lu", conversationID, (unsigned long)index, (unsigned long)text.hash];
+            NSString *messageID = [self messageIDFromObject:raw fallback:fallback];
+            DSConversationSnapshot *snapshot = self.conversations[conversationID] ?: [[DSConversationSnapshot alloc] init];
+            NSMutableArray<DSMessageSnapshot *> *messages = [snapshot.messages mutableCopy] ?: [NSMutableArray array];
+
+            BOOL duplicate = NO;
+            for (DSMessageSnapshot *existing in messages) {
+                if ([existing.messageID isEqualToString:messageID]) {
+                    duplicate = YES;
+                    break;
+                }
+            }
+            if (duplicate) return;
+
+            DSMessageSnapshot *message = [[DSMessageSnapshot alloc] init];
+            message.messageID = messageID;
+            message.text = text;
+            message.outgoing = [self messageIsOutgoing:raw];
+            message.timestamp = [self messageTimestamp:raw fallback:now + index / 1000.0];
+            NSString *recentText = self.recentOutgoingTexts[conversationID];
+            NSDate *recentDate = self.recentOutgoingDates[conversationID];
+            if (!message.outgoing && recentText.length && [recentText isEqualToString:text] &&
+                recentDate && -recentDate.timeIntervalSinceNow < 120) {
+                message.outgoing = YES;
+                [self.recentOutgoingTexts removeObjectForKey:conversationID];
+                [self.recentOutgoingDates removeObjectForKey:conversationID];
+            }
+            [messages addObject:message];
+            [messages sortUsingComparator:^NSComparisonResult(DSMessageSnapshot *a, DSMessageSnapshot *b) {
+                if (a.timestamp < b.timestamp) return NSOrderedAscending;
+                if (a.timestamp > b.timestamp) return NSOrderedDescending;
+                return NSOrderedSame;
+            }];
+            if (messages.count > 100) {
+                [messages removeObjectsInRange:NSMakeRange(0, messages.count - 100)];
+            }
+
+            id conversation = [self conversationForID:conversationID inMap:conversationMap];
+            snapshot.conversationID = conversationID;
+            snapshot.messages = messages;
+            if (conversation) snapshot.conversationObject = conversation;
+            NSString *displayName = [self displayNameFromObject:conversation];
+            if (!displayName.length) displayName = [self displayNameFromObject:raw];
+            if (displayName.length) snapshot.displayName = displayName;
+            if (!snapshot.displayName.length) snapshot.displayName = conversationID;
+            self.conversations[conversationID] = snapshot;
+            [changedConversationIDs addObject:conversationID];
+        }];
+
+        NSMutableArray<DSConversationSnapshot *> *changed = [NSMutableArray array];
+        for (NSString *conversationID in changedConversationIDs) {
+            DSConversationSnapshot *snapshot = self.conversations[conversationID];
+            if (snapshot) [changed addObject:snapshot];
+        }
+        return changed;
+    }
+}
+
 - (NSArray<DSConversationSnapshot *> *)knownConversations {
     @synchronized (self.conversations) {
         NSArray *values = self.conversations.allValues;
@@ -311,10 +449,24 @@ static id DSSharedInstanceForClass(Class targetClass) {
     }
 
     id controller = conversation.controller;
-    id sendController = DSSafeValue(controller, @[@"sendMessageController", @"messageViewModel.sendMessageController"]);
+    id messageObject = [self messageObjectForText:text];
+    SEL directSelector = NSSelectorFromString(@"sendMessage:");
+    if (controller && messageObject && [controller respondsToSelector:directSelector]) {
+        @try {
+            ((void (*)(id, SEL, id))objc_msgSend)(controller, directSelector, messageObject);
+            self.recentOutgoingTexts[conversation.conversationID] = text;
+            self.recentOutgoingDates[conversation.conversationID] = NSDate.date;
+            completion(YES, nil);
+            return;
+        } @catch (__unused NSException *exception) {}
+    }
+
+    id sendController = DSSafeValue(controller, @[@"sendMessageController", @"inputViewController.sendMessageController", @"messageViewModel.sendMessageController"]);
     if (!sendController) sendController = DSSharedInstanceForClass(objc_getClass("AWEIMSendMessageController"));
-    id conversationObject = conversation.conversationObject ?: DSSafeValue(controller, @[@"conversation"]);
+    id conversationObject = conversation.conversationObject ?: DSSafeValue(controller, @[@"msg_conversation", @"currentConversation", @"conversation"]);
     if ([self invokeSendController:sendController text:text conversation:conversationObject]) {
+        self.recentOutgoingTexts[conversation.conversationID] = text;
+        self.recentOutgoingDates[conversation.conversationID] = NSDate.date;
         completion(YES, nil);
         return;
     }
@@ -325,6 +477,8 @@ static id DSSharedInstanceForClass(Class targetClass) {
         id sender = DSSharedInstanceForClass(senderClass);
         BOOL sent = [self invokeSendController:sender text:text conversation:fetchedConversation];
         if (sent) {
+            self.recentOutgoingTexts[conversation.conversationID] = text;
+            self.recentOutgoingDates[conversation.conversationID] = NSDate.date;
             completion(YES, nil);
         } else {
             NSString *message = @"没找到当前抖音版本的发信方法。请先打开目标聊天，再点一次测试发话；仍失败就是私有 API 已变。";
@@ -358,31 +512,31 @@ static id DSSharedInstanceForClass(Class targetClass) {
     if (!sender || !conversation) return NO;
     id message = [self messageObjectForText:text];
     if (!message) return NO;
-    NSArray<NSString *> *selectors = @[
-        @"sendMessage:conversation:forwardMessage:mentionUsers:",
-        @"sendMessage:conversation:forwardMessage:mentionUsers:enterFrom:",
-        @"sendMessage:conversation:",
-        @"sendMessage:",
-    ];
+    SEL selector = NSSelectorFromString(@"sendMessage:conversation:forwardMessage:mentionUsers:");
+    @try {
+        if ([sender respondsToSelector:selector]) {
+            ((void (*)(id, SEL, id, id, id, id))objc_msgSend)(sender, selector, message, conversation, nil, nil);
+            return YES;
+        }
 
-    for (NSString *name in selectors) {
-        SEL selector = NSSelectorFromString(name);
-        if (![sender respondsToSelector:selector]) continue;
-        NSMethodSignature *signature = [sender methodSignatureForSelector:selector];
-        if (!signature) continue;
-        NSInvocation *invocation = [NSInvocation invocationWithMethodSignature:signature];
-        invocation.target = sender;
-        invocation.selector = selector;
-        id nilValue = nil;
-        id enterFrom = @"DouyinDeepSeek";
-        if (signature.numberOfArguments > 2) [invocation setArgument:&message atIndex:2];
-        if (signature.numberOfArguments > 3) [invocation setArgument:&conversation atIndex:3];
-        if (signature.numberOfArguments > 4) [invocation setArgument:&nilValue atIndex:4];
-        if (signature.numberOfArguments > 5) [invocation setArgument:&nilValue atIndex:5];
-        if (signature.numberOfArguments > 6) [invocation setArgument:&enterFrom atIndex:6];
-        [invocation invoke];
-        return YES;
-    }
+        selector = NSSelectorFromString(@"sendMessage:conversation:forwardMessage:mentionUsers:enterFrom:");
+        if ([sender respondsToSelector:selector]) {
+            ((void (*)(id, SEL, id, id, id, id, id))objc_msgSend)(sender, selector, message, conversation, nil, nil, @"DouyinDeepSeek");
+            return YES;
+        }
+
+        selector = NSSelectorFromString(@"sendMessage:conversation:");
+        if ([sender respondsToSelector:selector]) {
+            ((void (*)(id, SEL, id, id))objc_msgSend)(sender, selector, message, conversation);
+            return YES;
+        }
+
+        selector = NSSelectorFromString(@"sendMessage:");
+        if ([sender respondsToSelector:selector]) {
+            ((void (*)(id, SEL, id))objc_msgSend)(sender, selector, message);
+            return YES;
+        }
+    } @catch (__unused NSException *exception) {}
     return NO;
 }
 
@@ -422,6 +576,9 @@ static id DSSharedInstanceForClass(Class targetClass) {
     NSMutableArray *parts = [NSMutableArray array];
     [parts addObject:objc_getClass("AWESettingBaseViewController") ? @"设置入口✓" : @"设置入口✗"];
     [parts addObject:objc_getClass("AWEIMMessageListViewController") ? @"消息列表✓" : @"消息列表✗"];
+    Class notifierClass = objc_getClass("TIMXOMessageNotifier");
+    BOOL notifierReady = class_getInstanceMethod(notifierClass, NSSelectorFromString(@"onMessagesCreated:belongingConversationMap:reason:context:")) != NULL;
+    [parts addObject:notifierReady ? @"全局收信✓" : @"全局收信✗"];
     id creator = DSSharedInstanceForClass(objc_getClass("AWEIMShareMessageCreater"));
     BOOL creatorReady = [creator respondsToSelector:NSSelectorFromString(@"sendTextMessageWithContent:")];
     [parts addObject:creatorReady ? @"消息创建器✓" : @"消息创建器✗"];

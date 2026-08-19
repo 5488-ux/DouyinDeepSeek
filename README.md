@@ -12,6 +12,7 @@
 - 默认使用 `deepseek-v4-flash`，也可切换 `deepseek-v4-pro`。
 - “测试 DeepSeek API”会发起真实 `/chat/completions` 请求并显示结果。
 - 兼容字符串和分段文本响应；若思考过程吃完输出 Token 导致 `content` 为空，会自动关闭思考模式并以更高 Token 上限重试一次。
+- 39.9.0 使用真实的 `msg_messages`、`msg_conversation`、`contentText`、`sendFromMe` 接口读取上下文，并监听 `TIMXOMessageNotifier` 全局新消息回调，不再只盯着当前打开的聊天页。
 - “测试发话”会先选择联系人，读取最近对话上下文，生成回复并自动发送。
 - 正式自动回复同样携带最近 N 条上下文；我方消息映射为 `assistant`，对方消息映射为 `user`。
 - 首次捕获会话只建立基线，不会对旧消息突然补回复。

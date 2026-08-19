@@ -24,6 +24,8 @@ typedef void (^DSSendCompletion)(BOOL success, NSError * _Nullable error);
 
 + (instancetype)shared;
 - (nullable DSConversationSnapshot *)captureMessageController:(id)controller;
+- (NSArray<DSConversationSnapshot *> *)ingestRawMessages:(NSArray *)rawMessages
+                                  belongingConversationMap:(nullable NSDictionary *)conversationMap;
 - (void)trackMessageController:(id)controller;
 - (void)trackFriendModel:(id)friendModel;
 - (NSArray<DSConversationSnapshot *> *)knownConversations;
@@ -35,4 +37,3 @@ typedef void (^DSSendCompletion)(BOOL success, NSError * _Nullable error);
 @end
 
 NS_ASSUME_NONNULL_END
-

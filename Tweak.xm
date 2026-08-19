@@ -2,6 +2,7 @@
 #import <Foundation/Foundation.h>
 #import <objc/message.h>
 #import <objc/runtime.h>
+#import <math.h>
 
 #import "Sources/DSConfig.h"
 #import "Sources/DSDeepSeekClient.h"
@@ -27,6 +28,7 @@ static BOOL DSHookInstanceMethod(Class targetClass, SEL selector, IMP replacemen
 + (instancetype)shared;
 - (void)startPolling;
 - (void)observeController:(id)controller;
+- (void)observeIncomingConversation:(DSConversationSnapshot *)conversation;
 - (void)processPendingConversation:(DSConversationSnapshot *)conversation;
 @end
 
@@ -98,6 +100,30 @@ static BOOL DSHookInstanceMethod(Class targetClass, SEL selector, IMP replacemen
     }
 
     [self processPendingConversation:conversation];
+}
+
+- (void)observeIncomingConversation:(DSConversationSnapshot *)conversation {
+    DSMessageSnapshot *latest = conversation.messages.lastObject;
+    if (!conversation.conversationID.length || !latest.messageID.length) return;
+
+    NSString *previousMessageID = self.lastSeenMessageIDs[conversation.conversationID];
+    self.lastSeenMessageIDs[conversation.conversationID] = latest.messageID;
+    if ([previousMessageID isEqualToString:latest.messageID]) return;
+
+    if (latest.outgoing || !latest.text.length) {
+        [self.pendingMessageIDs removeObjectForKey:conversation.conversationID];
+        return;
+    }
+
+    // 全局消息创建回调只处理刚收到的消息，额外挡住异常历史回放。
+    NSTimeInterval age = fabs(NSDate.date.timeIntervalSince1970 - latest.timestamp);
+    if (latest.timestamp > 0 && age > 300) return;
+
+    DSConfig *config = [DSConfig shared];
+    if (config.enabled && config.apiKey.length) {
+        self.pendingMessageIDs[conversation.conversationID] = latest.messageID;
+        [self processPendingConversation:conversation];
+    }
 }
 
 - (void)processPendingConversation:(DSConversationSnapshot *)conversation {
@@ -243,7 +269,7 @@ static id DSNewSectionDataArray(id self, SEL _cmd) {
     id item = [[itemClass alloc] init];
     DSSetObjectSettingValue(item, @"setIdentifier:", @"DouyinDeepSeek");
     DSSetObjectSettingValue(item, @"setTitle:", @"DeepSeek AI");
-    DSSetObjectSettingValue(item, @"setDetail:", @"0.1.5");
+    DSSetObjectSettingValue(item, @"setDetail:", @"0.1.6");
     DSSetIntegerSettingValue(item, @"setType:", 0);
     DSSetObjectSettingValue(item, @"setSvgIconImageName:", @"ic_module_outlined_20");
     DSSetIntegerSettingValue(item, @"setCellType:", 26);
@@ -285,6 +311,26 @@ static void DSNewAfterReloadData(id self, SEL _cmd) {
     [[DSAutoReplyEngine shared] observeController:self];
 }
 
+static void (*DSOldAfterUpdateData)(id, SEL);
+static void DSNewAfterUpdateData(id self, SEL _cmd) {
+    DSOldAfterUpdateData(self, _cmd);
+    [[DSAutoReplyEngine shared] observeController:self];
+}
+
+static void (*DSOldMessagesCreated)(id, SEL, id, id, id, id);
+static void DSNewMessagesCreated(id self, SEL _cmd, id messages, id conversationMap, id reason, id context) {
+    DSOldMessagesCreated(self, _cmd, messages, conversationMap, reason, context);
+    if (![messages isKindOfClass:NSArray.class] || ![(NSArray *)messages count]) return;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        NSArray<DSConversationSnapshot *> *snapshots = [[DSRuntimeBridge shared]
+            ingestRawMessages:messages
+            belongingConversationMap:[conversationMap isKindOfClass:NSDictionary.class] ? conversationMap : nil];
+        for (DSConversationSnapshot *snapshot in snapshots) {
+            [[DSAutoReplyEngine shared] observeIncomingConversation:snapshot];
+        }
+    });
+}
+
 static id (*DSOldFriendInit)(id, SEL, id);
 static id DSNewFriendInit(id self, SEL _cmd, id user) {
     id result = DSOldFriendInit(self, _cmd, user);
@@ -296,6 +342,8 @@ static BOOL DSSettingsHooked = NO;
 static BOOL DSCardStyleHooked = NO;
 static BOOL DSMessageHooked = NO;
 static BOOL DSReloadHooked = NO;
+static BOOL DSUpdateHooked = NO;
+static BOOL DSGlobalMessageHooked = NO;
 static BOOL DSFriendHooked = NO;
 
 static void DSInstallHooks(void) {
@@ -329,6 +377,22 @@ static void DSInstallHooks(void) {
             DSReloadHooked = DSHookInstanceMethod(messageClass, selector, (IMP)DSNewAfterReloadData, (IMP *)&DSOldAfterReloadData);
         }
     }
+    if (messageClass && !DSUpdateHooked) {
+        SEL selector = NSSelectorFromString(@"vm_afterUpdateData");
+        Method method = class_getInstanceMethod(messageClass, selector);
+        if (method) {
+            DSUpdateHooked = DSHookInstanceMethod(messageClass, selector, (IMP)DSNewAfterUpdateData, (IMP *)&DSOldAfterUpdateData);
+        }
+    }
+
+    Class notifierClass = objc_getClass("TIMXOMessageNotifier");
+    if (notifierClass && !DSGlobalMessageHooked) {
+        SEL selector = NSSelectorFromString(@"onMessagesCreated:belongingConversationMap:reason:context:");
+        Method method = class_getInstanceMethod(notifierClass, selector);
+        if (method) {
+            DSGlobalMessageHooked = DSHookInstanceMethod(notifierClass, selector, (IMP)DSNewMessagesCreated, (IMP *)&DSOldMessagesCreated);
+        }
+    }
 
     Class friendClass = objc_getClass("AWEIMFriendInfoDataModel");
     if (friendClass && !DSFriendHooked) {
@@ -342,7 +406,7 @@ static void DSInstallHooks(void) {
 
 static void DSScheduleHookRetries(NSInteger attempt) {
     DSInstallHooks();
-    if ((DSSettingsHooked && DSMessageHooked && DSFriendHooked) || attempt >= 30) return;
+    if ((DSSettingsHooked && DSMessageHooked && DSFriendHooked && DSGlobalMessageHooked) || attempt >= 60) return;
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         DSScheduleHookRetries(attempt + 1);
     });
