@@ -42,13 +42,13 @@ static const void *DSSettingsInjectedKey = &DSSettingsInjectedKey;
 
 - (void)startPolling {
     if (self.pollTimer) return;
-    __weak typeof(self) weakSelf = self;
+    __weak DSAutoReplyEngine *weakEngine = self;
     self.pollTimer = [NSTimer scheduledTimerWithTimeInterval:1.5 repeats:YES block:^(NSTimer *timer) {
-        __strong typeof(weakSelf) self = weakSelf;
-        if (!self) return;
+        __strong DSAutoReplyEngine *strongEngine = weakEngine;
+        if (!strongEngine) return;
         NSArray *controllers;
-        @synchronized (self.controllers) { controllers = self.controllers.allObjects; }
-        for (id controller in controllers) [self observeController:controller];
+        @synchronized (strongEngine.controllers) { controllers = strongEngine.controllers.allObjects; }
+        for (id controller in controllers) [strongEngine observeController:controller];
     }];
 }
 
@@ -222,4 +222,3 @@ __attribute__((constructor)) static void DouyinDeepSeekInitialize(void) {
         });
     }
 }
-
