@@ -442,6 +442,36 @@ static id DSSharedInstanceForClass(Class targetClass) {
     return result;
 }
 
+- (BOOL)sendTextThroughYukiIfAvailable:(NSString *)text
+                        conversationID:(NSString *)conversationID
+                            diagnostic:(NSString *)diagnostic
+                            completion:(DSSendCompletion)completion {
+    Class managerClass = objc_getClass("YukiAutoMessageManager");
+    id manager = DSSharedInstanceForClass(managerClass);
+    SEL selector = NSSelectorFromString(@"sendMessageToConversationID:text:completion:");
+    if (!manager || ![manager respondsToSelector:selector]) return NO;
+
+    @try {
+        void (^callback)(BOOL) = ^(BOOL success) {
+            dispatch_async(dispatch_get_main_queue(), ^{
+                if (success) {
+                    self.recentOutgoingTexts[conversationID] = text;
+                    self.recentOutgoingDates[conversationID] = NSDate.date;
+                    completion(YES, nil);
+                } else {
+                    NSString *message = [NSString stringWithFormat:@"原生发信链失败（%@）；Yuki 发信链也返回失败。请保持目标聊天已打开，再重试一次。", diagnostic];
+                    completion(NO, [NSError errorWithDomain:DSBridgeErrorDomain code:-3 userInfo:@{NSLocalizedDescriptionKey: message}]);
+                }
+            });
+        };
+        ((void (*)(id, SEL, id, id, id))objc_msgSend)(manager, selector, conversationID, text, [callback copy]);
+        return YES;
+    } @catch (NSException *exception) {
+        NSLog(@"[DouyinDeepSeek] Yuki send bridge exception: %@", exception.reason);
+        return NO;
+    }
+}
+
 - (void)sendText:(NSString *)text toConversation:(DSConversationSnapshot *)conversation completion:(DSSendCompletion)completion {
     if (!text.length || !conversation.conversationID.length) {
         completion(NO, [NSError errorWithDomain:DSBridgeErrorDomain code:-1 userInfo:@{NSLocalizedDescriptionKey: @"发送内容或会话 ID 为空。"}]);
@@ -481,7 +511,23 @@ static id DSSharedInstanceForClass(Class targetClass) {
             self.recentOutgoingDates[conversation.conversationID] = NSDate.date;
             completion(YES, nil);
         } else {
-            NSString *message = @"没找到当前抖音版本的发信方法。请先打开目标聊天，再点一次测试发话；仍失败就是私有 API 已变。";
+            Class creatorClass = objc_getClass("AWEIMShareMessageCreater");
+            id creator = DSSharedInstanceForClass(creatorClass);
+            BOOL creatorReady = creator && [creator respondsToSelector:NSSelectorFromString(@"sendTextMessageWithContent:")];
+            BOOL senderReady = sender && ([sender respondsToSelector:NSSelectorFromString(@"sendMessage:conversation:forwardMessage:mentionUsers:")] ||
+                                          [sender respondsToSelector:NSSelectorFromString(@"sendMessage:conversation:forwardMessage:mentionUsers:enterFrom:")] ||
+                                          [sender respondsToSelector:NSSelectorFromString(@"sendMessage:")]);
+            NSString *diagnostic = [NSString stringWithFormat:@"会话对象%@，消息创建器%@，发信器%@",
+                                    fetchedConversation ? @"✓" : @"✗",
+                                    creatorReady ? @"✓" : @"✗",
+                                    senderReady ? @"✓" : @"✗"];
+            if ([self sendTextThroughYukiIfAvailable:text
+                                      conversationID:conversation.conversationID
+                                          diagnostic:diagnostic
+                                          completion:completion]) {
+                return;
+            }
+            NSString *message = [NSString stringWithFormat:@"原生发信链失败（%@）；未检测到可调用的 Yuki 发信链。请先打开目标聊天，再点一次测试发话。", diagnostic];
             completion(NO, [NSError errorWithDomain:DSBridgeErrorDomain code:-2 userInfo:@{NSLocalizedDescriptionKey: message}]);
         }
     }];
