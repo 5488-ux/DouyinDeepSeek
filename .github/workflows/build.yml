@@ -27,7 +27,7 @@ jobs:
       - name: Install Theos
         run: |
           git clone --recursive --depth=1 https://github.com/theos/theos.git "$GITHUB_WORKSPACE/theos"
-          "$GITHUB_WORKSPACE/theos/bin/install-sdk" 16.5
+          "$GITHUB_WORKSPACE/theos/bin/install-sdk" latest
 
       - name: Build package
         env:
@@ -50,4 +50,3 @@ jobs:
           name: DouyinDeepSeek-${{ matrix.scheme }}
           path: artifact/${{ matrix.scheme }}/*.deb
           if-no-files-found: error
-
