@@ -63,6 +63,18 @@ static NSArray *DSArrayValue(id object, NSArray<NSString *> *paths) {
     return @[];
 }
 
+static id DSSharedInstanceForClass(Class targetClass) {
+    if (!targetClass) return nil;
+    for (NSString *name in @[@"sharedInstance", @"sharedManager", @"defaultManager", @"sharedUtility"]) {
+        SEL selector = NSSelectorFromString(name);
+        if (![targetClass respondsToSelector:selector]) continue;
+        id (*send)(id, SEL) = (id (*)(id, SEL))objc_msgSend;
+        id instance = send(targetClass, selector);
+        if (instance) return instance;
+    }
+    return nil;
+}
+
 @interface DSRuntimeBridge ()
 @property (nonatomic, strong) NSMutableDictionary<NSString *, DSConversationSnapshot *> *conversations;
 @property (nonatomic, strong) NSHashTable *friendModels;
@@ -164,8 +176,31 @@ static NSArray *DSArrayValue(id object, NSArray<NSString *> *paths) {
     BOOL outgoing = DSBoolValue(object, @[@"isSelf", @"isSendByMe", @"isMine", @"isSelfMessage", @"isFromMe"], &found);
     if (found) return outgoing;
 
-    id numeric = DSSafeValue(object, @[@"msg_isSelf", @"senderIsSelf", @"isSender"]);
+    id wrappedMessage = DSSafeValue(object, @[@"iesMessage", @"message", @"timMessage"]);
+    if (wrappedMessage && wrappedMessage != object) {
+        outgoing = DSBoolValue(wrappedMessage, @[@"isSelf", @"isSendByMe", @"isMine", @"isSelfMessage", @"isFromMe"], &found);
+        if (found) return outgoing;
+    }
+
+    id numeric = DSSafeValue(object, @[
+        @"msg_isSelf", @"senderIsSelf", @"isSender",
+        @"iesMessage.msg_isSelf", @"iesMessage.senderIsSelf", @"iesMessage.isSender",
+        @"message.msg_isSelf", @"message.senderIsSelf"
+    ]);
     if ([numeric respondsToSelector:@selector(boolValue)]) return [numeric boolValue];
+
+    NSString *senderID = DSStringValue(DSSafeValue(object, @[
+        @"senderID", @"senderId", @"fromUserID", @"fromUserId", @"msg_sender",
+        @"sender.uid", @"sender.userID", @"iesMessage.senderID", @"iesMessage.senderId",
+        @"iesMessage.fromUserID", @"iesMessage.sender.uid"
+    ]));
+    Class currentUserClass = objc_getClass("TIMXCurrentUserManager");
+    id currentUserManager = DSSharedInstanceForClass(currentUserClass);
+    id currentUser = DSSafeValue(currentUserManager, @[@"currentUser", @"user", @"currentIMUser"]);
+    NSString *currentUserID = DSStringValue(DSSafeValue(currentUser ?: currentUserManager, @[
+        @"uid", @"userID", @"userId", @"secUid", @"identifier"
+    ]));
+    if (senderID.length && currentUserID.length) return [senderID isEqualToString:currentUserID];
     return NO;
 }
 
@@ -276,18 +311,8 @@ static NSArray *DSArrayValue(id object, NSArray<NSString *> *paths) {
     }
 
     id controller = conversation.controller;
-    NSArray<NSString *> *directSelectors = @[@"sendTextMessageWithContent:", @"sendTextMessage:", @"sendMessageWithText:"];
-    for (NSString *name in directSelectors) {
-        SEL selector = NSSelectorFromString(name);
-        if (controller && [controller respondsToSelector:selector]) {
-            void (*send)(id, SEL, id) = (void (*)(id, SEL, id))objc_msgSend;
-            send(controller, selector, text);
-            completion(YES, nil);
-            return;
-        }
-    }
-
     id sendController = DSSafeValue(controller, @[@"sendMessageController", @"messageViewModel.sendMessageController"]);
+    if (!sendController) sendController = DSSharedInstanceForClass(objc_getClass("AWEIMSendMessageController"));
     id conversationObject = conversation.conversationObject ?: DSSafeValue(controller, @[@"conversation"]);
     if ([self invokeSendController:sendController text:text conversation:conversationObject]) {
         completion(YES, nil);
@@ -297,7 +322,7 @@ static NSArray *DSArrayValue(id object, NSArray<NSString *> *paths) {
     [self fetchConversation:conversation.conversationID completion:^(id fetchedConversation) {
         if (fetchedConversation) conversation.conversationObject = fetchedConversation;
         Class senderClass = objc_getClass("AWEIMSendMessageController");
-        id sender = senderClass ? [[senderClass alloc] init] : nil;
+        id sender = DSSharedInstanceForClass(senderClass);
         BOOL sent = [self invokeSendController:sender text:text conversation:fetchedConversation];
         if (sent) {
             completion(YES, nil);
@@ -313,29 +338,31 @@ static NSArray *DSArrayValue(id object, NSArray<NSString *> *paths) {
     for (NSString *className in classNames) {
         Class creatorClass = objc_getClass(className.UTF8String);
         if (!creatorClass) continue;
-        SEL selector = NSSelectorFromString(@"messageObjectForText:");
+        SEL selector = NSSelectorFromString(@"sendTextMessageWithContent:");
+        id creator = DSSharedInstanceForClass(creatorClass);
+        if (creator && [creator respondsToSelector:selector]) {
+            id (*send)(id, SEL, id) = (id (*)(id, SEL, id))objc_msgSend;
+            id message = send(creator, selector, text);
+            if (message) return message;
+        }
         if ([creatorClass respondsToSelector:selector]) {
             id (*send)(id, SEL, id) = (id (*)(id, SEL, id))objc_msgSend;
             id message = send(creatorClass, selector, text);
             if (message) return message;
         }
-        id creator = [[creatorClass alloc] init];
-        if ([creator respondsToSelector:selector]) {
-            id (*send)(id, SEL, id) = (id (*)(id, SEL, id))objc_msgSend;
-            id message = send(creator, selector, text);
-            if (message) return message;
-        }
     }
-    return text;
+    return nil;
 }
 
 - (BOOL)invokeSendController:(id)sender text:(NSString *)text conversation:(id)conversation {
     if (!sender || !conversation) return NO;
     id message = [self messageObjectForText:text];
+    if (!message) return NO;
     NSArray<NSString *> *selectors = @[
-        @"sendMessage:conversation:forwardMessage:mentionUsers:enterFrom:",
         @"sendMessage:conversation:forwardMessage:mentionUsers:",
+        @"sendMessage:conversation:forwardMessage:mentionUsers:enterFrom:",
         @"sendMessage:conversation:",
+        @"sendMessage:",
     ];
 
     for (NSString *name in selectors) {
@@ -363,20 +390,20 @@ static NSArray *DSArrayValue(id object, NSArray<NSString *> *paths) {
     Class utilityClass = objc_getClass("IESIMConversationUtility");
     if (!utilityClass) { completion(nil); return; }
 
-    SEL selector = NSSelectorFromString(@"asyncGetConversationForIdentifier:completion:");
-    id target = nil;
-    if ([utilityClass respondsToSelector:selector]) {
-        target = utilityClass;
-    } else {
-        for (NSString *singletonName in @[@"sharedInstance", @"sharedUtility", @"defaultUtility"]) {
-            SEL singletonSelector = NSSelectorFromString(singletonName);
-            if ([utilityClass respondsToSelector:singletonSelector]) {
-                id (*send)(id, SEL) = (id (*)(id, SEL))objc_msgSend;
-                target = send(utilityClass, singletonSelector);
-                if ([target respondsToSelector:selector]) break;
-            }
+    id sharedUtility = DSSharedInstanceForClass(utilityClass);
+    SEL syncSelector = NSSelectorFromString(@"conversationForIdentifier:");
+    for (id target in @[utilityClass, sharedUtility ?: NSNull.null]) {
+        if (target == NSNull.null || ![target respondsToSelector:syncSelector]) continue;
+        id (*send)(id, SEL, id) = (id (*)(id, SEL, id))objc_msgSend;
+        id conversation = send(target, syncSelector, conversationID);
+        if (conversation) {
+            dispatch_async(dispatch_get_main_queue(), ^{ completion(conversation); });
+            return;
         }
     }
+
+    SEL selector = NSSelectorFromString(@"asyncGetConversationForIdentifier:completion:");
+    id target = [utilityClass respondsToSelector:selector] ? utilityClass : sharedUtility;
     if (!target || ![target respondsToSelector:selector]) { completion(nil); return; }
 
     void (^callback)(id) = ^(id fetched) { dispatch_async(dispatch_get_main_queue(), ^{ completion(fetched); }); };
@@ -395,10 +422,17 @@ static NSArray *DSArrayValue(id object, NSArray<NSString *> *paths) {
     NSMutableArray *parts = [NSMutableArray array];
     [parts addObject:objc_getClass("AWESettingBaseViewController") ? @"设置入口✓" : @"设置入口✗"];
     [parts addObject:objc_getClass("AWEIMMessageListViewController") ? @"消息列表✓" : @"消息列表✗"];
-    [parts addObject:objc_getClass("AWEIMSendMessageController") ? @"发信器✓" : @"发信器✗"];
+    id creator = DSSharedInstanceForClass(objc_getClass("AWEIMShareMessageCreater"));
+    BOOL creatorReady = [creator respondsToSelector:NSSelectorFromString(@"sendTextMessageWithContent:")];
+    [parts addObject:creatorReady ? @"消息创建器✓" : @"消息创建器✗"];
+    id sender = DSSharedInstanceForClass(objc_getClass("AWEIMSendMessageController"));
+    BOOL senderReady = [sender respondsToSelector:NSSelectorFromString(@"sendMessage:conversation:forwardMessage:mentionUsers:")] ||
+                       [sender respondsToSelector:NSSelectorFromString(@"sendMessage:conversation:forwardMessage:mentionUsers:enterFrom:")] ||
+                       [sender respondsToSelector:NSSelectorFromString(@"sendMessage:conversation:")] ||
+                       [sender respondsToSelector:NSSelectorFromString(@"sendMessage:")];
+    [parts addObject:senderReady ? @"发信器✓" : @"发信器✗"];
     [parts addObject:objc_getClass("IESIMConversationUtility") ? @"会话工具✓" : @"会话工具✗"];
     return [parts componentsJoinedByString:@"  "];
 }
 
 @end
-

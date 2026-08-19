@@ -15,10 +15,12 @@ static const void *DSSettingsInjectedKey = &DSSettingsInjectedKey;
 + (instancetype)shared;
 - (void)startPolling;
 - (void)observeController:(id)controller;
+- (void)processPendingConversation:(DSConversationSnapshot *)conversation;
 @end
 
 @interface DSAutoReplyEngine ()
 @property (nonatomic, strong) NSMutableDictionary<NSString *, NSString *> *lastSeenMessageIDs;
+@property (nonatomic, strong) NSMutableDictionary<NSString *, NSString *> *pendingMessageIDs;
 @property (nonatomic, strong) NSMutableDictionary<NSString *, NSDate *> *lastReplyDates;
 @property (nonatomic, strong) NSMutableSet<NSString *> *busyConversationIDs;
 @property (nonatomic, strong) NSHashTable *controllers;
@@ -33,6 +35,7 @@ static const void *DSSettingsInjectedKey = &DSSettingsInjectedKey;
     dispatch_once(&onceToken, ^{
         engine = [[self alloc] init];
         engine.lastSeenMessageIDs = [NSMutableDictionary dictionary];
+        engine.pendingMessageIDs = [NSMutableDictionary dictionary];
         engine.lastReplyDates = [NSMutableDictionary dictionary];
         engine.busyConversationIDs = [NSMutableSet set];
         engine.controllers = [NSHashTable weakObjectsHashTable];
@@ -61,44 +64,89 @@ static const void *DSSettingsInjectedKey = &DSSettingsInjectedKey;
     if (!conversation.conversationID.length || !latest.messageID.length) return;
 
     NSString *previousMessageID = self.lastSeenMessageIDs[conversation.conversationID];
-    self.lastSeenMessageIDs[conversation.conversationID] = latest.messageID;
 
     // 第一次见到会话只建立基线，绝不拿旧消息突然回复。
-    if (!previousMessageID.length) return;
-    if ([previousMessageID isEqualToString:latest.messageID]) return;
-    if (latest.outgoing || !latest.text.length) return;
+    if (!previousMessageID.length) {
+        self.lastSeenMessageIDs[conversation.conversationID] = latest.messageID;
+        return;
+    }
+
+    if (![previousMessageID isEqualToString:latest.messageID]) {
+        self.lastSeenMessageIDs[conversation.conversationID] = latest.messageID;
+        if (latest.outgoing || !latest.text.length) {
+            // 用户自己已经回复时，不再补发旧的 AI 回复。
+            [self.pendingMessageIDs removeObjectForKey:conversation.conversationID];
+            return;
+        }
+        DSConfig *config = [DSConfig shared];
+        if (config.enabled && config.apiKey.length) {
+            // 生成中或冷却期的新消息留在 pending，绝不提前吞掉。
+            self.pendingMessageIDs[conversation.conversationID] = latest.messageID;
+        }
+    }
+
+    [self processPendingConversation:conversation];
+}
+
+- (void)processPendingConversation:(DSConversationSnapshot *)conversation {
+    NSString *conversationID = conversation.conversationID;
+    NSString *pendingMessageID = self.pendingMessageIDs[conversationID];
+    if (!pendingMessageID.length) return;
 
     DSConfig *config = [DSConfig shared];
-    if (!config.enabled || !config.apiKey.length) return;
-    if ([self.busyConversationIDs containsObject:conversation.conversationID]) return;
+    if (!config.enabled || !config.apiKey.length) {
+        [self.pendingMessageIDs removeObjectForKey:conversationID];
+        return;
+    }
+    if ([self.busyConversationIDs containsObject:conversationID]) return;
 
-    NSDate *lastReplyDate = self.lastReplyDates[conversation.conversationID];
+    NSDate *lastReplyDate = self.lastReplyDates[conversationID];
     if (lastReplyDate && -lastReplyDate.timeIntervalSinceNow < config.cooldown) return;
 
     NSArray *context = [[DSRuntimeBridge shared] apiMessagesForConversation:conversation];
     if (!context.count) return;
 
-    NSString *conversationID = [conversation.conversationID copy];
+    NSString *processingMessageID = [pendingMessageID copy];
     [self.busyConversationIDs addObject:conversationID];
     [[DSDeepSeekClient shared] generateReplyWithMessages:context conversationID:conversationID completion:^(NSString *reply, NSError *error) {
         if (error || !reply.length) {
             NSLog(@"[DouyinDeepSeek] generation failed for %@: %@", conversationID, error.localizedDescription);
+            if ([self.pendingMessageIDs[conversationID] isEqualToString:processingMessageID]) {
+                [self.pendingMessageIDs removeObjectForKey:conversationID];
+            }
             [self.busyConversationIDs removeObject:conversationID];
+            DSConversationSnapshot *newer = [[DSRuntimeBridge shared] conversationForID:conversationID];
+            if (newer) [self processPendingConversation:newer];
             return;
         }
         if (![DSConfig shared].enabled) {
+            if ([self.pendingMessageIDs[conversationID] isEqualToString:processingMessageID]) {
+                [self.pendingMessageIDs removeObjectForKey:conversationID];
+            }
             [self.busyConversationIDs removeObject:conversationID];
+            return;
+        }
+        if (![self.pendingMessageIDs[conversationID] isEqualToString:processingMessageID]) {
+            // 生成期间来了更新消息，或用户已经手动回复；丢弃这条过期生成结果。
+            [self.busyConversationIDs removeObject:conversationID];
+            DSConversationSnapshot *newer = [[DSRuntimeBridge shared] conversationForID:conversationID];
+            if (newer) [self processPendingConversation:newer];
             return;
         }
         DSConversationSnapshot *fresh = [[DSRuntimeBridge shared] conversationForID:conversationID] ?: conversation;
         [[DSRuntimeBridge shared] sendText:reply toConversation:fresh completion:^(BOOL success, NSError *sendError) {
             if (success) {
                 self.lastReplyDates[conversationID] = NSDate.date;
-                NSLog(@"[DouyinDeepSeek] context reply sent to %@", conversationID);
+                NSLog(@"[DouyinDeepSeek] context reply handed to Douyin for %@", conversationID);
             } else {
                 NSLog(@"[DouyinDeepSeek] send failed for %@: %@", conversationID, sendError.localizedDescription);
             }
+            if ([self.pendingMessageIDs[conversationID] isEqualToString:processingMessageID]) {
+                [self.pendingMessageIDs removeObjectForKey:conversationID];
+            }
             [self.busyConversationIDs removeObject:conversationID];
+            DSConversationSnapshot *newer = [[DSRuntimeBridge shared] conversationForID:conversationID];
+            if (newer) [self processPendingConversation:newer];
         }];
     }];
 }

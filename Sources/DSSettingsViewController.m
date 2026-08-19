@@ -50,7 +50,7 @@ typedef NS_ENUM(NSInteger, DSSettingsSection) {
 - (NSString *)tableView:(UITableView *)tableView titleForFooterInSection:(NSInteger)section {
     if (section == DSSettingsSectionMaster) return @"首次看到一个会话时只记录最后消息，不会突然翻旧账自动回复。";
     if (section == DSSettingsSectionReply) return @"正式自动回复和测试发话都会携带该会话最近 N 条文本上下文。图片、语音等非文本消息暂不送给模型。";
-    if (section == DSSettingsSectionTest) return @"测试发话会在选中联系人后直接生成并发送。请先打开目标聊天一次，让插件抓到上下文。";
+    if (section == DSSettingsSectionTest) return @"测试发话会在选中联系人后生成并交给抖音发信接口。请先打开目标聊天一次；接口调用成功后仍需回到聊天确认真实送达。";
     return nil;
 }
 
@@ -233,8 +233,8 @@ typedef NS_ENUM(NSInteger, DSSettingsSection) {
         }
         [[DSRuntimeBridge shared] sendText:reply toConversation:conversation completion:^(BOOL success, NSError *sendError) {
             [self setBusy:NO title:nil];
-            NSString *title = success ? @"测试发话已发送" : @"生成成功，但发送失败";
-            NSString *message = success ? [NSString stringWithFormat:@"发给：%@\n\n%@", conversation.displayName, reply] : [NSString stringWithFormat:@"已生成：%@\n\n发送错误：%@", reply, sendError.localizedDescription];
+            NSString *title = success ? @"已提交给抖音发信接口" : @"生成成功，但发信接口调用失败";
+            NSString *message = success ? [NSString stringWithFormat:@"目标：%@\n\n%@\n\n请返回聊天确认消息是否真实送达。", conversation.displayName, reply] : [NSString stringWithFormat:@"已生成：%@\n\n发信错误：%@", reply, sendError.localizedDescription];
             [self showResultTitle:title message:message];
         }];
     }];
@@ -260,4 +260,3 @@ typedef NS_ENUM(NSInteger, DSSettingsSection) {
 }
 
 @end
-
