@@ -142,7 +142,7 @@ static BOOL DSHookInstanceMethod(Class targetClass, SEL selector, IMP replacemen
     if (lastReplyDate && -lastReplyDate.timeIntervalSinceNow < config.cooldown) return;
 
     NSArray *context = [[DSRuntimeBridge shared] apiMessagesForConversation:conversation];
-    if (!context.count) return;
+    if (!conversation.messages.count) return;
 
     NSString *processingMessageID = [pendingMessageID copy];
     [self.busyConversationIDs addObject:conversationID];
@@ -269,7 +269,7 @@ static id DSNewSectionDataArray(id self, SEL _cmd) {
     id item = [[itemClass alloc] init];
     DSSetObjectSettingValue(item, @"setIdentifier:", @"DouyinDeepSeek");
     DSSetObjectSettingValue(item, @"setTitle:", @"DeepSeek AI");
-    DSSetObjectSettingValue(item, @"setDetail:", @"0.2.0");
+    DSSetObjectSettingValue(item, @"setDetail:", @"0.2.1");
     DSSetIntegerSettingValue(item, @"setType:", 0);
     DSSetObjectSettingValue(item, @"setSvgIconImageName:", @"ic_module_outlined_20");
     DSSetIntegerSettingValue(item, @"setCellType:", 26);

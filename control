@@ -1,6 +1,6 @@
 Package: com.codex.douyin.deepseek
 Name: Douyin DeepSeek Auto Reply
-Version: 0.2.0
+Version: 0.2.1
 Architecture: iphoneos-arm64
 Description: DeepSeek context-aware auto reply for Douyin private messages.
 Maintainer: 5488-ux

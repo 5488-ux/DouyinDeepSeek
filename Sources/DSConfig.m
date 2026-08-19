@@ -23,6 +23,7 @@ static NSString * const DSKeychainAccount = @"api-key";
         [DSDefaultsPrefix stringByAppendingString:@"baseURL"]: @"https://api.deepseek.com/v1/chat/completions",
         [DSDefaultsPrefix stringByAppendingString:@"model"]: @"deepseek-v4-flash",
         [DSDefaultsPrefix stringByAppendingString:@"systemPrompt"]: @"你正在代替我回复抖音私信。请结合完整上下文自然、简洁地回答，保持我的口吻，不要提到自己是AI，不要编造上下文里没有的事实。只输出要发送的回复正文。",
+        [DSDefaultsPrefix stringByAppendingString:@"ownerName"]: @"我",
         [DSDefaultsPrefix stringByAppendingString:@"contextLimit"]: @20,
         [DSDefaultsPrefix stringByAppendingString:@"cooldown"]: @15,
         [DSDefaultsPrefix stringByAppendingString:@"maxReplyTokens"]: @1024,
@@ -51,6 +52,12 @@ static NSString * const DSKeychainAccount = @"api-key";
 
 - (NSString *)systemPrompt { return [self valueForSetting:@"systemPrompt"]; }
 - (void)setSystemPrompt:(NSString *)value { [self setValue:value.length ? value : @"请结合上下文自然回复，只输出回复正文。" forSetting:@"systemPrompt"]; }
+
+- (NSString *)ownerName { return [self valueForSetting:@"ownerName"]; }
+- (void)setOwnerName:(NSString *)value {
+    NSString *trimmed = [value stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+    [self setValue:trimmed.length ? trimmed : @"我" forSetting:@"ownerName"];
+}
 
 - (NSInteger)contextLimit { return MAX(2, [[self valueForSetting:@"contextLimit"] integerValue]); }
 - (void)setContextLimit:(NSInteger)value { [self setValue:@(MAX(2, MIN(100, value))) forSetting:@"contextLimit"]; }

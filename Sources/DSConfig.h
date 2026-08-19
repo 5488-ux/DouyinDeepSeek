@@ -10,6 +10,7 @@ NS_ASSUME_NONNULL_BEGIN
 @property (nonatomic, copy) NSString *baseURL;
 @property (nonatomic, copy) NSString *model;
 @property (nonatomic, copy) NSString *systemPrompt;
+@property (nonatomic, copy) NSString *ownerName;
 @property (nonatomic, assign) NSInteger contextLimit;
 @property (nonatomic, assign) NSTimeInterval cooldown;
 @property (nonatomic, assign) NSInteger maxReplyTokens;
@@ -20,4 +21,3 @@ NS_ASSUME_NONNULL_BEGIN
 @end
 
 NS_ASSUME_NONNULL_END
-

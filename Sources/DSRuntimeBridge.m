@@ -472,18 +472,31 @@ static id DSUnwrappedConversation(id conversation) {
 }
 
 - (NSArray<NSDictionary<NSString *,NSString *> *> *)apiMessagesForConversation:(DSConversationSnapshot *)conversation {
-    NSInteger limit = [DSConfig shared].contextLimit;
+    DSConfig *config = [DSConfig shared];
+    NSInteger limit = config.contextLimit;
     NSArray<DSMessageSnapshot *> *all = conversation.messages ?: @[];
     NSUInteger start = all.count > limit ? all.count - limit : 0;
     NSMutableArray *result = [NSMutableArray array];
+    NSString *ownerName = config.ownerName.length ? config.ownerName : @"我";
+    NSString *contactName = conversation.displayName.length ? conversation.displayName : @"对方";
+    NSString *identityInstruction = [NSString stringWithFormat:
+        @"这是账号主人“%@”与联系人“%@”的一对一私信。历史记录中，role=assistant 和【%@说】都表示账号主人本人此前发送的内容，不代表模型自己说过；role=user 和【%@说】都表示联系人发来的内容。你现在必须站在“%@”的身份，结合双方完整上下文，生成下一条发给“%@”的回复。要明确区分双方，不能把联系人说的话当成账号主人说的，也不能遗漏账号主人此前说过的话。只输出回复正文。",
+        ownerName, contactName, ownerName, contactName, ownerName, contactName];
+    [result addObject:@{ @"role": @"system", @"content": identityInstruction }];
     for (NSUInteger i = start; i < all.count; i++) {
         DSMessageSnapshot *message = all[i];
         if (!message.text.length) continue;
+        NSString *speaker = message.outgoing ? ownerName : contactName;
+        NSString *labeledText = [NSString stringWithFormat:@"【%@说】%@", speaker, message.text];
         [result addObject:@{
             @"role": message.outgoing ? @"assistant" : @"user",
-            @"content": message.text,
+            @"content": labeledText,
         }];
     }
+    [self recordDiagnostic:[NSString stringWithFormat:@"构建实名上下文：我=%@ 对方=%@ 历史文本=%lu API消息=%lu",
+                            ownerName, contactName,
+                            (unsigned long)(all.count - start),
+                            (unsigned long)result.count]];
     return result;
 }
 
@@ -857,18 +870,28 @@ static id DSUnwrappedConversation(id conversation) {
 
     NSUInteger conversationCount = 0;
     @synchronized (self.conversations) { conversationCount = self.conversations.count; }
+    NSUInteger ownerMessageCount = 0;
+    NSUInteger contactMessageCount = 0;
+    for (DSMessageSnapshot *message in conversation.messages) {
+        if (message.outgoing) ownerMessageCount++;
+        else contactMessageCount++;
+    }
     NSArray<NSString *> *events;
     @synchronized (self.diagnosticEvents) { events = [self.diagnosticEvents copy]; }
 
     NSMutableString *report = [NSMutableString string];
     [report appendString:@"DouyinDeepSeek 运行报错\n"];
-    [report appendString:@"插件版本：0.2.0\n"];
+    [report appendString:@"插件版本：0.2.1\n"];
     [report appendFormat:@"抖音版本：%@ (%@)\n", appVersion, appBuild];
     [report appendFormat:@"系统：iOS %@ / %@\n", UIDevice.currentDevice.systemVersion, UIDevice.currentDevice.model];
     [report appendFormat:@"兼容性：%@\n", [self compatibilitySummary]];
     [report appendFormat:@"已记录会话：%lu\n", (unsigned long)conversationCount];
     [report appendFormat:@"目标：%@ / %@\n", conversation.displayName ?: @"nil", conversation.conversationID ?: @"nil"];
     [report appendFormat:@"上下文文本：%lu\n", (unsigned long)conversation.messages.count];
+    [report appendFormat:@"身份映射：账号主人=%@ / 联系人=%@\n",
+     [DSConfig shared].ownerName ?: @"我", conversation.displayName ?: @"对方"];
+    [report appendFormat:@"身份统计：账号主人消息=%lu / 联系人消息=%lu\n",
+     (unsigned long)ownerMessageCount, (unsigned long)contactMessageCount];
     [report appendFormat:@"控制器：%@ / sendMessage:%@\n",
      controller ? NSStringFromClass([controller class]) : @"nil",
      [controller respondsToSelector:NSSelectorFromString(@"sendMessage:")] ? @"✓" : @"✗"];

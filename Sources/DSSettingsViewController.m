@@ -31,7 +31,7 @@ typedef NS_ENUM(NSInteger, DSSettingsSection) {
     switch (section) {
         case DSSettingsSectionMaster: return 2;
         case DSSettingsSectionAPI: return 5;
-        case DSSettingsSectionReply: return 4;
+        case DSSettingsSectionReply: return 5;
         case DSSettingsSectionTest: return 4;
         default: return 0;
     }
@@ -49,7 +49,7 @@ typedef NS_ENUM(NSInteger, DSSettingsSection) {
 
 - (NSString *)tableView:(UITableView *)tableView titleForFooterInSection:(NSInteger)section {
     if (section == DSSettingsSectionMaster) return @"首次看到一个会话时只记录最后消息，不会突然翻旧账自动回复。";
-    if (section == DSSettingsSectionReply) return @"正式自动回复和测试发话都会携带该会话最近 N 条文本上下文。图片、语音等非文本消息暂不送给模型。";
+    if (section == DSSettingsSectionReply) return @"每条上下文都会明确标注“谁说的”。我的称呼代表账号主人；联系人名称自动取当前抖音昵称。图片、语音等非文本消息暂不送给模型。";
     if (section == DSSettingsSectionTest) return @"测试发话会在选中联系人后生成并交给抖音发信接口。请先打开目标聊天一次；接口调用成功后仍需回到聊天确认真实送达。";
     return nil;
 }
@@ -103,17 +103,20 @@ typedef NS_ENUM(NSInteger, DSSettingsSection) {
         }
     } else if (indexPath.section == DSSettingsSectionReply) {
         if (indexPath.row == 0) {
+            cell.textLabel.text = @"我的称呼";
+            cell.detailTextLabel.text = config.ownerName;
+        } else if (indexPath.row == 1) {
             cell.textLabel.text = @"角色提示词";
             cell.detailTextLabel.text = @"点击编辑";
-        } else if (indexPath.row == 1) {
+        } else if (indexPath.row == 2) {
             cell.textLabel.text = @"上下文条数";
             cell.detailTextLabel.text = [NSString stringWithFormat:@"%ld 条", (long)config.contextLimit];
-        } else if (indexPath.row == 2) {
+        } else if (indexPath.row == 3) {
             cell.textLabel.text = @"同会话冷却";
             cell.detailTextLabel.text = [NSString stringWithFormat:@"%.0f 秒", config.cooldown];
         } else {
             cell.textLabel.text = @"上下文规则";
-            cell.detailTextLabel.text = @"我方=assistant，对方=user";
+            cell.detailTextLabel.text = @"每句标注：我的称呼/联系人昵称";
             cell.selectionStyle = UITableViewCellSelectionStyleNone;
             cell.accessoryType = UITableViewCellAccessoryNone;
         }
@@ -152,9 +155,10 @@ typedef NS_ENUM(NSInteger, DSSettingsSection) {
         else if (indexPath.row == 2) [self chooseModel];
         else if (indexPath.row == 4) [self editIntegerSettingWithTitle:@"最大回复 Token" value:[DSConfig shared].maxReplyTokens minimum:32 maximum:4096 save:^(NSInteger value) { [DSConfig shared].maxReplyTokens = value; }];
     } else if (indexPath.section == DSSettingsSectionReply) {
-        if (indexPath.row == 0) [self editTextSettingWithTitle:@"角色提示词" value:[DSConfig shared].systemPrompt placeholder:@"告诉模型如何代替你回复" secure:NO save:^(NSString *value) { [DSConfig shared].systemPrompt = value; }];
-        else if (indexPath.row == 1) [self editIntegerSettingWithTitle:@"上下文条数" value:[DSConfig shared].contextLimit minimum:2 maximum:100 save:^(NSInteger value) { [DSConfig shared].contextLimit = value; }];
-        else if (indexPath.row == 2) [self editIntegerSettingWithTitle:@"同会话冷却秒数" value:(NSInteger)[DSConfig shared].cooldown minimum:0 maximum:3600 save:^(NSInteger value) { [DSConfig shared].cooldown = value; }];
+        if (indexPath.row == 0) [self editTextSettingWithTitle:@"我的称呼" value:[DSConfig shared].ownerName placeholder:@"例如：小明（留空则为“我”）" secure:NO save:^(NSString *value) { [DSConfig shared].ownerName = value; }];
+        else if (indexPath.row == 1) [self editTextSettingWithTitle:@"角色提示词" value:[DSConfig shared].systemPrompt placeholder:@"告诉模型如何代替你回复" secure:NO save:^(NSString *value) { [DSConfig shared].systemPrompt = value; }];
+        else if (indexPath.row == 2) [self editIntegerSettingWithTitle:@"上下文条数" value:[DSConfig shared].contextLimit minimum:2 maximum:100 save:^(NSInteger value) { [DSConfig shared].contextLimit = value; }];
+        else if (indexPath.row == 3) [self editIntegerSettingWithTitle:@"同会话冷却秒数" value:(NSInteger)[DSConfig shared].cooldown minimum:0 maximum:3600 save:^(NSInteger value) { [DSConfig shared].cooldown = value; }];
     } else if (indexPath.section == DSSettingsSectionTest) {
         if (indexPath.row == 0) [self testAPI];
         else if (indexPath.row == 1) [self chooseConversationForTest];
@@ -224,7 +228,7 @@ typedef NS_ENUM(NSInteger, DSSettingsSection) {
 
 - (void)runTestForConversation:(DSConversationSnapshot *)conversation {
     NSArray *messages = [[DSRuntimeBridge shared] apiMessagesForConversation:conversation];
-    if (!messages.count) {
+    if (!conversation.messages.count) {
         [self showResultTitle:@"没有上下文" message:@"先打开这个人的聊天，等消息显示出来，再回来点测试发话。不能没上下文硬生成。"];
         return;
     }
