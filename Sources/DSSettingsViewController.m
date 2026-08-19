@@ -32,7 +32,7 @@ typedef NS_ENUM(NSInteger, DSSettingsSection) {
         case DSSettingsSectionMaster: return 2;
         case DSSettingsSectionAPI: return 5;
         case DSSettingsSectionReply: return 4;
-        case DSSettingsSectionTest: return 3;
+        case DSSettingsSectionTest: return 4;
         default: return 0;
     }
 }
@@ -124,6 +124,9 @@ typedef NS_ENUM(NSInteger, DSSettingsSection) {
         } else if (indexPath.row == 1) {
             cell.textLabel.text = @"测试发话";
             cell.detailTextLabel.text = @"选联系人→读上下文→生成→发送";
+        } else if (indexPath.row == 2) {
+            cell.textLabel.text = @"复制运行报错";
+            cell.detailTextLabel.text = @"发送路线、对象类型、异常记录";
         } else {
             cell.textLabel.text = @"Hook 兼容性";
             cell.detailTextLabel.text = [[DSRuntimeBridge shared] compatibilitySummary];
@@ -155,6 +158,7 @@ typedef NS_ENUM(NSInteger, DSSettingsSection) {
     } else if (indexPath.section == DSSettingsSectionTest) {
         if (indexPath.row == 0) [self testAPI];
         else if (indexPath.row == 1) [self chooseConversationForTest];
+        else if (indexPath.row == 2) [self showDiagnosticForConversation:nil];
     }
 }
 
@@ -234,10 +238,20 @@ typedef NS_ENUM(NSInteger, DSSettingsSection) {
         [[DSRuntimeBridge shared] sendText:reply toConversation:conversation completion:^(BOOL success, NSError *sendError) {
             [self setBusy:NO title:nil];
             NSString *title = success ? @"已提交给抖音发信接口" : @"生成成功，但发信接口调用失败";
-            NSString *message = success ? [NSString stringWithFormat:@"目标：%@\n\n%@\n\n请返回聊天确认消息是否真实送达。", conversation.displayName, reply] : [NSString stringWithFormat:@"已生成：%@\n\n发信错误：%@", reply, sendError.localizedDescription];
-            [self showResultTitle:title message:message];
+            NSString *message = success ? [NSString stringWithFormat:@"目标：%@\n\n%@\n\n请返回聊天确认消息是否真实送达。", conversation.displayName, reply] : [NSString stringWithFormat:@"已生成：%@\n\n发信错误：%@\n\n点下面的“复制报错”，把完整内容发给开发者。", reply, sendError.localizedDescription];
+            NSString *report = success ? nil : [[DSRuntimeBridge shared] diagnosticReportForConversation:conversation];
+            [self showResultTitle:title message:message copyText:report];
         }];
     }];
+}
+
+- (void)showDiagnosticForConversation:(DSConversationSnapshot *)conversation {
+    DSConversationSnapshot *target = conversation ?: [DSRuntimeBridge shared].knownConversations.firstObject;
+    NSString *report = [[DSRuntimeBridge shared] diagnosticReportForConversation:target];
+    NSString *message = target
+        ? [NSString stringWithFormat:@"已生成 %@ 的完整运行报错。点击“复制报错”后直接发给开发者。", target.displayName]
+        : @"当前还没有捕获到会话，但仍可复制 Hook 和运行环境报错。先打开一个聊天再测试，信息会更完整。";
+    [self showResultTitle:@"运行报错" message:message copyText:report];
 }
 
 - (void)setBusy:(BOOL)busy title:(NSString *)title {
@@ -254,7 +268,16 @@ typedef NS_ENUM(NSInteger, DSSettingsSection) {
 }
 
 - (void)showResultTitle:(NSString *)title message:(NSString *)message {
+    [self showResultTitle:title message:message copyText:nil];
+}
+
+- (void)showResultTitle:(NSString *)title message:(NSString *)message copyText:(NSString *)copyText {
     UIAlertController *alert = [UIAlertController alertControllerWithTitle:title message:message preferredStyle:UIAlertControllerStyleAlert];
+    if (copyText.length) {
+        [alert addAction:[UIAlertAction actionWithTitle:@"复制报错" style:UIAlertActionStyleDefault handler:^(__unused UIAlertAction *action) {
+            UIPasteboard.generalPasteboard.string = copyText;
+        }]];
+    }
     [alert addAction:[UIAlertAction actionWithTitle:@"知道了" style:UIAlertActionStyleDefault handler:nil]];
     [self presentViewController:alert animated:YES completion:nil];
 }

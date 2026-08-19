@@ -119,6 +119,7 @@ static id DSSharedInstanceForClass(Class targetClass) {
 @property (nonatomic, strong) NSHashTable *messageControllers;
 @property (nonatomic, strong) NSMutableDictionary<NSString *, NSString *> *recentOutgoingTexts;
 @property (nonatomic, strong) NSMutableDictionary<NSString *, NSDate *> *recentOutgoingDates;
+@property (nonatomic, strong) NSMutableArray<NSString *> *diagnosticEvents;
 @property (nonatomic, strong) dispatch_queue_t stateQueue;
 @end
 
@@ -139,9 +140,26 @@ static id DSSharedInstanceForClass(Class targetClass) {
         _messageControllers = [NSHashTable weakObjectsHashTable];
         _recentOutgoingTexts = [NSMutableDictionary dictionary];
         _recentOutgoingDates = [NSMutableDictionary dictionary];
+        _diagnosticEvents = [NSMutableArray array];
         _stateQueue = dispatch_queue_create("com.codex.douyin.deepseek.bridge", DISPATCH_QUEUE_SERIAL);
+        [self recordDiagnostic:@"插件运行桥初始化完成"];
     }
     return self;
+}
+
+- (void)recordDiagnostic:(NSString *)message {
+    if (!message.length) return;
+    NSDateFormatter *formatter = [[NSDateFormatter alloc] init];
+    formatter.locale = [NSLocale localeWithLocaleIdentifier:@"zh_CN"];
+    formatter.dateFormat = @"HH:mm:ss.SSS";
+    NSString *line = [NSString stringWithFormat:@"[%@] %@", [formatter stringFromDate:NSDate.date], message];
+    @synchronized (self.diagnosticEvents) {
+        [self.diagnosticEvents addObject:line];
+        if (self.diagnosticEvents.count > 60) {
+            [self.diagnosticEvents removeObjectsInRange:NSMakeRange(0, self.diagnosticEvents.count - 60)];
+        }
+    }
+    NSLog(@"[DouyinDeepSeek] %@", message);
 }
 
 - (void)trackMessageController:(id)controller {
@@ -149,6 +167,7 @@ static id DSSharedInstanceForClass(Class targetClass) {
     @synchronized (self.messageControllers) {
         [self.messageControllers addObject:controller];
     }
+    [self recordDiagnostic:[NSString stringWithFormat:@"发现消息控制器：%@", NSStringFromClass([controller class])]];
 }
 
 - (void)trackFriendModel:(id)friendModel {
@@ -282,7 +301,11 @@ static id DSSharedInstanceForClass(Class targetClass) {
         rawMessages = DSArrayValue(conversation, @[@"messages", @"messageList", @"allMessages"]);
     }
     if (!conversationID.length && rawMessages.count) conversationID = [self conversationIDFromObject:rawMessages.lastObject];
-    if (!conversationID.length) return nil;
+    if (!conversationID.length) {
+        [self recordDiagnostic:[NSString stringWithFormat:@"控制器捕获失败：%@ 未解析到会话 ID，原始消息=%lu",
+                                NSStringFromClass([controller class]), (unsigned long)rawMessages.count]];
+        return nil;
+    }
 
     NSString *displayName = [self displayNameFromObject:controller];
     if (!displayName.length) displayName = [self displayNameFromObject:conversation];
@@ -321,6 +344,12 @@ static id DSSharedInstanceForClass(Class targetClass) {
         if (conversation) snapshot.conversationObject = conversation;
         self.conversations[conversationID] = snapshot;
     }
+    [self recordDiagnostic:[NSString stringWithFormat:@"会话捕获：ID=%@ 控制器=%@ 会话对象=%@ 原始=%lu 文本=%lu",
+                            conversationID,
+                            NSStringFromClass([controller class]),
+                            conversation ? NSStringFromClass([conversation class]) : @"nil",
+                            (unsigned long)rawMessages.count,
+                            (unsigned long)messages.count]];
     return snapshot;
 }
 
@@ -337,7 +366,11 @@ static id DSSharedInstanceForClass(Class targetClass) {
 
 - (NSArray<DSConversationSnapshot *> *)ingestRawMessages:(NSArray *)rawMessages
                                   belongingConversationMap:(NSDictionary *)conversationMap {
-    if (![rawMessages isKindOfClass:NSArray.class] || !rawMessages.count) return @[];
+    if (![rawMessages isKindOfClass:NSArray.class] || !rawMessages.count) {
+        [self recordDiagnostic:[NSString stringWithFormat:@"全局收信回调无可用数组：实际类型=%@",
+                                rawMessages ? NSStringFromClass([rawMessages class]) : @"nil"]];
+        return @[];
+    }
 
     NSMutableSet<NSString *> *changedConversationIDs = [NSMutableSet set];
     NSTimeInterval now = NSDate.date.timeIntervalSince1970;
@@ -404,6 +437,10 @@ static id DSSharedInstanceForClass(Class targetClass) {
             DSConversationSnapshot *snapshot = self.conversations[conversationID];
             if (snapshot) [changed addObject:snapshot];
         }
+        [self recordDiagnostic:[NSString stringWithFormat:@"全局收信：原始=%lu 解析会话=%lu map=%@",
+                                (unsigned long)rawMessages.count,
+                                (unsigned long)changed.count,
+                                conversationMap ? NSStringFromClass([conversationMap class]) : @"nil"]];
         return changed;
     }
 }
@@ -449,11 +486,23 @@ static id DSSharedInstanceForClass(Class targetClass) {
     Class managerClass = objc_getClass("YukiAutoMessageManager");
     id manager = DSSharedInstanceForClass(managerClass);
     SEL selector = NSSelectorFromString(@"sendMessageToConversationID:text:completion:");
-    if (!manager || ![manager respondsToSelector:selector]) return NO;
+    if (!manager || ![manager respondsToSelector:selector]) {
+        [self recordDiagnostic:[NSString stringWithFormat:@"Yuki 兜底不可用：class=%@ manager=%@ selector=%@",
+                                managerClass ? @"✓" : @"✗",
+                                manager ? NSStringFromClass([manager class]) : @"nil",
+                                [manager respondsToSelector:selector] ? @"✓" : @"✗"]];
+        return NO;
+    }
 
     @try {
+        [self recordDiagnostic:[NSString stringWithFormat:@"调用 Yuki 兜底：manager=%@ cid=%@ selector=%@",
+                                NSStringFromClass([manager class]), conversationID, NSStringFromSelector(selector)]];
+        __block BOOL didFinish = NO;
         void (^callback)(BOOL) = ^(BOOL success) {
             dispatch_async(dispatch_get_main_queue(), ^{
+                if (didFinish) return;
+                didFinish = YES;
+                [self recordDiagnostic:[NSString stringWithFormat:@"Yuki 兜底回调：%@", success ? @"成功" : @"失败"]];
                 if (success) {
                     self.recentOutgoingTexts[conversationID] = text;
                     self.recentOutgoingDates[conversationID] = NSDate.date;
@@ -465,30 +514,55 @@ static id DSSharedInstanceForClass(Class targetClass) {
             });
         };
         ((void (*)(id, SEL, id, id, id))objc_msgSend)(manager, selector, conversationID, text, [callback copy]);
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(12 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            if (didFinish) return;
+            didFinish = YES;
+            [self recordDiagnostic:@"Yuki 兜底超时：12 秒没有回调"];
+            NSString *message = [NSString stringWithFormat:@"原生发信链失败（%@）；Yuki 发信链调用后 12 秒无回调。", diagnostic];
+            completion(NO, [NSError errorWithDomain:DSBridgeErrorDomain code:-4 userInfo:@{NSLocalizedDescriptionKey: message}]);
+        });
         return YES;
     } @catch (NSException *exception) {
-        NSLog(@"[DouyinDeepSeek] Yuki send bridge exception: %@", exception.reason);
+        [self recordDiagnostic:[NSString stringWithFormat:@"Yuki 兜底异常：%@ / %@", exception.name, exception.reason ?: @"无原因"]];
         return NO;
     }
 }
 
 - (void)sendText:(NSString *)text toConversation:(DSConversationSnapshot *)conversation completion:(DSSendCompletion)completion {
     if (!text.length || !conversation.conversationID.length) {
+        [self recordDiagnostic:[NSString stringWithFormat:@"发送入口拒绝：text=%lu cid=%@",
+                                (unsigned long)text.length, conversation.conversationID ?: @"nil"]];
         completion(NO, [NSError errorWithDomain:DSBridgeErrorDomain code:-1 userInfo:@{NSLocalizedDescriptionKey: @"发送内容或会话 ID 为空。"}]);
         return;
     }
 
     id controller = conversation.controller;
     id messageObject = [self messageObjectForText:text];
+    [self recordDiagnostic:[NSString stringWithFormat:@"开始发送：cid=%@ 文本=%lu controller=%@ conversation=%@ message=%@",
+                            conversation.conversationID,
+                            (unsigned long)text.length,
+                            controller ? NSStringFromClass([controller class]) : @"nil",
+                            conversation.conversationObject ? NSStringFromClass([conversation.conversationObject class]) : @"nil",
+                            messageObject ? NSStringFromClass([messageObject class]) : @"nil"]];
     SEL directSelector = NSSelectorFromString(@"sendMessage:");
     if (controller && messageObject && [controller respondsToSelector:directSelector]) {
         @try {
+            [self recordDiagnostic:[NSString stringWithFormat:@"尝试控制器直发：%@ %@",
+                                    NSStringFromClass([controller class]), NSStringFromSelector(directSelector)]];
             ((void (*)(id, SEL, id))objc_msgSend)(controller, directSelector, messageObject);
             self.recentOutgoingTexts[conversation.conversationID] = text;
             self.recentOutgoingDates[conversation.conversationID] = NSDate.date;
+            [self recordDiagnostic:@"控制器直发已返回"];
             completion(YES, nil);
             return;
-        } @catch (__unused NSException *exception) {}
+        } @catch (NSException *exception) {
+            [self recordDiagnostic:[NSString stringWithFormat:@"控制器直发异常：%@ / %@", exception.name, exception.reason ?: @"无原因"]];
+        }
+    } else {
+        [self recordDiagnostic:[NSString stringWithFormat:@"跳过控制器直发：controller=%@ message=%@ selector=%@",
+                                controller ? @"✓" : @"✗",
+                                messageObject ? @"✓" : @"✗",
+                                [controller respondsToSelector:directSelector] ? @"✓" : @"✗"]];
     }
 
     id sendController = DSSafeValue(controller, @[@"sendMessageController", @"inputViewController.sendMessageController", @"messageViewModel.sendMessageController"]);
@@ -497,9 +571,14 @@ static id DSSharedInstanceForClass(Class targetClass) {
     if ([self invokeSendController:sendController text:text conversation:conversationObject]) {
         self.recentOutgoingTexts[conversation.conversationID] = text;
         self.recentOutgoingDates[conversation.conversationID] = NSDate.date;
+        [self recordDiagnostic:@"当前会话发信器调用已返回"];
         completion(YES, nil);
         return;
     }
+
+    [self recordDiagnostic:[NSString stringWithFormat:@"当前会话发信器失败，开始重新取会话：sender=%@ conversation=%@",
+                            sendController ? NSStringFromClass([sendController class]) : @"nil",
+                            conversationObject ? NSStringFromClass([conversationObject class]) : @"nil"]];
 
     [self fetchConversation:conversation.conversationID completion:^(id fetchedConversation) {
         if (fetchedConversation) conversation.conversationObject = fetchedConversation;
@@ -509,6 +588,7 @@ static id DSSharedInstanceForClass(Class targetClass) {
         if (sent) {
             self.recentOutgoingTexts[conversation.conversationID] = text;
             self.recentOutgoingDates[conversation.conversationID] = NSDate.date;
+            [self recordDiagnostic:@"重新取会话后的原生发信调用已返回"];
             completion(YES, nil);
         } else {
             Class creatorClass = objc_getClass("AWEIMShareMessageCreater");
@@ -521,6 +601,7 @@ static id DSSharedInstanceForClass(Class targetClass) {
                                     fetchedConversation ? @"✓" : @"✗",
                                     creatorReady ? @"✓" : @"✗",
                                     senderReady ? @"✓" : @"✗"];
+            [self recordDiagnostic:[NSString stringWithFormat:@"原生发信最终失败：%@", diagnostic]];
             if ([self sendTextThroughYukiIfAvailable:text
                                       conversationID:conversation.conversationID
                                           diagnostic:diagnostic
@@ -541,54 +622,86 @@ static id DSSharedInstanceForClass(Class targetClass) {
         SEL selector = NSSelectorFromString(@"sendTextMessageWithContent:");
         id creator = DSSharedInstanceForClass(creatorClass);
         if (creator && [creator respondsToSelector:selector]) {
-            id (*send)(id, SEL, id) = (id (*)(id, SEL, id))objc_msgSend;
-            id message = send(creator, selector, text);
-            if (message) return message;
+            @try {
+                id (*send)(id, SEL, id) = (id (*)(id, SEL, id))objc_msgSend;
+                id message = send(creator, selector, text);
+                [self recordDiagnostic:[NSString stringWithFormat:@"消息创建器实例调用：%@ -> %@",
+                                        NSStringFromClass([creator class]), message ? NSStringFromClass([message class]) : @"nil"]];
+                if (message) return message;
+            } @catch (NSException *exception) {
+                [self recordDiagnostic:[NSString stringWithFormat:@"消息创建器实例异常：%@ / %@", exception.name, exception.reason ?: @"无原因"]];
+            }
         }
         if ([creatorClass respondsToSelector:selector]) {
-            id (*send)(id, SEL, id) = (id (*)(id, SEL, id))objc_msgSend;
-            id message = send(creatorClass, selector, text);
-            if (message) return message;
+            @try {
+                id (*send)(id, SEL, id) = (id (*)(id, SEL, id))objc_msgSend;
+                id message = send(creatorClass, selector, text);
+                [self recordDiagnostic:[NSString stringWithFormat:@"消息创建器类调用：%@ -> %@",
+                                        className, message ? NSStringFromClass([message class]) : @"nil"]];
+                if (message) return message;
+            } @catch (NSException *exception) {
+                [self recordDiagnostic:[NSString stringWithFormat:@"消息创建器类异常：%@ / %@", exception.name, exception.reason ?: @"无原因"]];
+            }
         }
     }
+    [self recordDiagnostic:@"消息对象创建失败：未获得可发送消息对象"];
     return nil;
 }
 
 - (BOOL)invokeSendController:(id)sender text:(NSString *)text conversation:(id)conversation {
-    if (!sender || !conversation) return NO;
+    if (!sender || !conversation) {
+        [self recordDiagnostic:[NSString stringWithFormat:@"发信器调用前置失败：sender=%@ conversation=%@",
+                                sender ? NSStringFromClass([sender class]) : @"nil",
+                                conversation ? NSStringFromClass([conversation class]) : @"nil"]];
+        return NO;
+    }
     id message = [self messageObjectForText:text];
-    if (!message) return NO;
+    if (!message) {
+        [self recordDiagnostic:@"发信器调用前置失败：消息对象=nil"];
+        return NO;
+    }
     SEL selector = NSSelectorFromString(@"sendMessage:conversation:forwardMessage:mentionUsers:");
     @try {
         if ([sender respondsToSelector:selector]) {
+            [self recordDiagnostic:[NSString stringWithFormat:@"调用发信选择器：%@ %@", NSStringFromClass([sender class]), NSStringFromSelector(selector)]];
             ((void (*)(id, SEL, id, id, id, id))objc_msgSend)(sender, selector, message, conversation, nil, nil);
             return YES;
         }
 
         selector = NSSelectorFromString(@"sendMessage:conversation:forwardMessage:mentionUsers:enterFrom:");
         if ([sender respondsToSelector:selector]) {
+            [self recordDiagnostic:[NSString stringWithFormat:@"调用发信选择器：%@ %@", NSStringFromClass([sender class]), NSStringFromSelector(selector)]];
             ((void (*)(id, SEL, id, id, id, id, id))objc_msgSend)(sender, selector, message, conversation, nil, nil, @"DouyinDeepSeek");
             return YES;
         }
 
         selector = NSSelectorFromString(@"sendMessage:conversation:");
         if ([sender respondsToSelector:selector]) {
+            [self recordDiagnostic:[NSString stringWithFormat:@"调用发信选择器：%@ %@", NSStringFromClass([sender class]), NSStringFromSelector(selector)]];
             ((void (*)(id, SEL, id, id))objc_msgSend)(sender, selector, message, conversation);
             return YES;
         }
 
         selector = NSSelectorFromString(@"sendMessage:");
         if ([sender respondsToSelector:selector]) {
+            [self recordDiagnostic:[NSString stringWithFormat:@"调用发信选择器：%@ %@", NSStringFromClass([sender class]), NSStringFromSelector(selector)]];
             ((void (*)(id, SEL, id))objc_msgSend)(sender, selector, message);
             return YES;
         }
-    } @catch (__unused NSException *exception) {}
+    } @catch (NSException *exception) {
+        [self recordDiagnostic:[NSString stringWithFormat:@"发信选择器异常：%@ / %@", exception.name, exception.reason ?: @"无原因"]];
+    }
+    [self recordDiagnostic:[NSString stringWithFormat:@"发信器没有匹配选择器：%@", NSStringFromClass([sender class])]];
     return NO;
 }
 
 - (void)fetchConversation:(NSString *)conversationID completion:(void (^)(id _Nullable))completion {
     Class utilityClass = objc_getClass("IESIMConversationUtility");
-    if (!utilityClass) { completion(nil); return; }
+    if (!utilityClass) {
+        [self recordDiagnostic:@"重新取会话失败：IESIMConversationUtility 类不存在"];
+        completion(nil);
+        return;
+    }
 
     id sharedUtility = DSSharedInstanceForClass(utilityClass);
     SEL syncSelector = NSSelectorFromString(@"conversationForIdentifier:");
@@ -597,6 +710,9 @@ static id DSSharedInstanceForClass(Class targetClass) {
         id (*send)(id, SEL, id) = (id (*)(id, SEL, id))objc_msgSend;
         id conversation = send(target, syncSelector, conversationID);
         if (conversation) {
+            [self recordDiagnostic:[NSString stringWithFormat:@"同步取得会话：target=%@ result=%@",
+                                    object_isClass(target) ? NSStringFromClass(target) : NSStringFromClass([target class]),
+                                    NSStringFromClass([conversation class])]];
             dispatch_async(dispatch_get_main_queue(), ^{ completion(conversation); });
             return;
         }
@@ -604,9 +720,19 @@ static id DSSharedInstanceForClass(Class targetClass) {
 
     SEL selector = NSSelectorFromString(@"asyncGetConversationForIdentifier:completion:");
     id target = [utilityClass respondsToSelector:selector] ? utilityClass : sharedUtility;
-    if (!target || ![target respondsToSelector:selector]) { completion(nil); return; }
+    if (!target || ![target respondsToSelector:selector]) {
+        [self recordDiagnostic:@"重新取会话失败：同步为空且异步选择器不可用"];
+        completion(nil);
+        return;
+    }
 
-    void (^callback)(id) = ^(id fetched) { dispatch_async(dispatch_get_main_queue(), ^{ completion(fetched); }); };
+    [self recordDiagnostic:@"同步取会话为空，调用异步取会话"];
+    void (^callback)(id) = ^(id fetched) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [self recordDiagnostic:[NSString stringWithFormat:@"异步取会话结果：%@", fetched ? NSStringFromClass([fetched class]) : @"nil"]];
+            completion(fetched);
+        });
+    };
     NSMethodSignature *signature = [target methodSignatureForSelector:selector];
     NSInvocation *invocation = [NSInvocation invocationWithMethodSignature:signature];
     invocation.target = target;
@@ -636,6 +762,70 @@ static id DSSharedInstanceForClass(Class targetClass) {
     [parts addObject:senderReady ? @"发信器✓" : @"发信器✗"];
     [parts addObject:objc_getClass("IESIMConversationUtility") ? @"会话工具✓" : @"会话工具✗"];
     return [parts componentsJoinedByString:@"  "];
+}
+
+- (NSString *)diagnosticReportForConversation:(DSConversationSnapshot *)conversation {
+    NSDictionary *info = NSBundle.mainBundle.infoDictionary ?: @{};
+    NSString *appVersion = DSStringValue(info[@"CFBundleShortVersionString"]) ?: @"未知";
+    NSString *appBuild = DSStringValue(info[@"CFBundleVersion"]) ?: @"未知";
+    id controller = conversation.controller;
+    id conversationObject = conversation.conversationObject;
+    Class creatorClass = objc_getClass("AWEIMShareMessageCreater");
+    id creator = DSSharedInstanceForClass(creatorClass);
+    Class senderClass = objc_getClass("AWEIMSendMessageController");
+    id sender = DSSharedInstanceForClass(senderClass);
+    Class utilityClass = objc_getClass("IESIMConversationUtility");
+    Class yukiClass = objc_getClass("YukiAutoMessageManager");
+    id yuki = DSSharedInstanceForClass(yukiClass);
+
+    NSMutableArray<NSString *> *sendSelectors = [NSMutableArray array];
+    for (NSString *name in @[
+        @"sendMessage:conversation:forwardMessage:mentionUsers:",
+        @"sendMessage:conversation:forwardMessage:mentionUsers:enterFrom:",
+        @"sendMessage:conversation:",
+        @"sendMessage:"
+    ]) {
+        if ([sender respondsToSelector:NSSelectorFromString(name)]) [sendSelectors addObject:name];
+    }
+
+    NSUInteger conversationCount = 0;
+    @synchronized (self.conversations) { conversationCount = self.conversations.count; }
+    NSArray<NSString *> *events;
+    @synchronized (self.diagnosticEvents) { events = [self.diagnosticEvents copy]; }
+
+    NSMutableString *report = [NSMutableString string];
+    [report appendString:@"DouyinDeepSeek 运行报错\n"];
+    [report appendString:@"插件版本：0.1.8\n"];
+    [report appendFormat:@"抖音版本：%@ (%@)\n", appVersion, appBuild];
+    [report appendFormat:@"系统：iOS %@ / %@\n", UIDevice.currentDevice.systemVersion, UIDevice.currentDevice.model];
+    [report appendFormat:@"兼容性：%@\n", [self compatibilitySummary]];
+    [report appendFormat:@"已记录会话：%lu\n", (unsigned long)conversationCount];
+    [report appendFormat:@"目标：%@ / %@\n", conversation.displayName ?: @"nil", conversation.conversationID ?: @"nil"];
+    [report appendFormat:@"上下文文本：%lu\n", (unsigned long)conversation.messages.count];
+    [report appendFormat:@"控制器：%@ / sendMessage:%@\n",
+     controller ? NSStringFromClass([controller class]) : @"nil",
+     [controller respondsToSelector:NSSelectorFromString(@"sendMessage:")] ? @"✓" : @"✗"];
+    [report appendFormat:@"会话对象：%@\n", conversationObject ? NSStringFromClass([conversationObject class]) : @"nil"];
+    [report appendFormat:@"消息创建器：class=%@ instance=%@ selector=%@\n",
+     creatorClass ? @"✓" : @"✗",
+     creator ? NSStringFromClass([creator class]) : @"nil",
+     [creator respondsToSelector:NSSelectorFromString(@"sendTextMessageWithContent:")] ? @"✓" : @"✗"];
+    [report appendFormat:@"发信器：class=%@ instance=%@ selectors=%@\n",
+     senderClass ? @"✓" : @"✗",
+     sender ? NSStringFromClass([sender class]) : @"nil",
+     sendSelectors.count ? [sendSelectors componentsJoinedByString:@","] : @"无"];
+    [report appendFormat:@"会话工具：class=%@ sync=%@ async=%@\n",
+     utilityClass ? @"✓" : @"✗",
+     [utilityClass respondsToSelector:NSSelectorFromString(@"conversationForIdentifier:")] ? @"✓" : @"✗",
+     [utilityClass respondsToSelector:NSSelectorFromString(@"asyncGetConversationForIdentifier:completion:")] ? @"✓" : @"✗"];
+    [report appendFormat:@"Yuki：class=%@ manager=%@ send=%@\n",
+     yukiClass ? @"✓" : @"✗",
+     yuki ? NSStringFromClass([yuki class]) : @"nil",
+     [yuki respondsToSelector:NSSelectorFromString(@"sendMessageToConversationID:text:completion:")] ? @"✓" : @"✗"];
+    [report appendString:@"\n最近运行记录：\n"];
+    if (events.count) [report appendString:[events componentsJoinedByString:@"\n"]];
+    else [report appendString:@"无"];
+    return report;
 }
 
 @end

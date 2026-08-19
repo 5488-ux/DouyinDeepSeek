@@ -33,6 +33,7 @@ typedef void (^DSSendCompletion)(BOOL success, NSError * _Nullable error);
 - (NSArray<NSDictionary<NSString *, NSString *> *> *)apiMessagesForConversation:(DSConversationSnapshot *)conversation;
 - (void)sendText:(NSString *)text toConversation:(DSConversationSnapshot *)conversation completion:(DSSendCompletion)completion;
 - (NSString *)compatibilitySummary;
+- (NSString *)diagnosticReportForConversation:(nullable DSConversationSnapshot *)conversation;
 
 @end
 
