@@ -10,43 +10,33 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        scheme: [rootless, rootful]
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
-      - name: Install build dependencies
+      - name: Prepare Theos and iOS SDK
+        uses: Randomblock1/theos-action@v1
+
+      - name: Build rootless and rootful packages
         run: |
-          sudo apt-get update
-          sudo apt-get install -y build-essential fakeroot rsync curl perl git libxml2 xz-utils
+          mkdir -p artifact/rootless artifact/rootful
+          make clean package FINALPACKAGE=1 THEOS_PACKAGE_SCHEME=rootless
+          cp packages/*.deb artifact/rootless/
+          rm -f packages/*.deb
+          make clean package FINALPACKAGE=1 THEOS_PACKAGE_SCHEME=
+          cp packages/*.deb artifact/rootful/
 
-      - name: Install Theos
-        run: |
-          git clone --recursive --depth=1 https://github.com/theos/theos.git "$GITHUB_WORKSPACE/theos"
-          "$GITHUB_WORKSPACE/theos/bin/install-sdk" latest
-
-      - name: Build package
-        env:
-          THEOS: ${{ github.workspace }}/theos
-        run: |
-          if [ "${{ matrix.scheme }}" = "rootless" ]; then
-            make clean package FINALPACKAGE=1 THEOS_PACKAGE_SCHEME=rootless
-          else
-            make clean package FINALPACKAGE=1 THEOS_PACKAGE_SCHEME=
-          fi
-
-      - name: Stage artifact
-        run: |
-          mkdir -p "artifact/${{ matrix.scheme }}"
-          cp packages/*.deb "artifact/${{ matrix.scheme }}/"
-
-      - name: Upload package
-        uses: actions/upload-artifact@v4
+      - name: Upload rootless package
+        uses: actions/upload-artifact@v7
         with:
-          name: DouyinDeepSeek-${{ matrix.scheme }}
-          path: artifact/${{ matrix.scheme }}/*.deb
+          name: DouyinDeepSeek-rootless
+          path: artifact/rootless/*.deb
+          if-no-files-found: error
+
+      - name: Upload rootful package
+        uses: actions/upload-artifact@v7
+        with:
+          name: DouyinDeepSeek-rootful
+          path: artifact/rootful/*.deb
           if-no-files-found: error
