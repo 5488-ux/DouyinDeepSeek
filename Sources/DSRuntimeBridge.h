@@ -14,7 +14,7 @@ NS_ASSUME_NONNULL_BEGIN
 @property (nonatomic, copy) NSString *conversationID;
 @property (nonatomic, copy) NSString *displayName;
 @property (nonatomic, copy) NSArray<DSMessageSnapshot *> *messages;
-@property (nonatomic, weak, nullable) id controller;
+@property (nonatomic, strong, nullable) id controller;
 @property (nonatomic, strong, nullable) id conversationObject;
 @end
 

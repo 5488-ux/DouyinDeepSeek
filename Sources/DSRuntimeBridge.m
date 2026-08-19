@@ -113,6 +113,12 @@ static id DSSharedInstanceForClass(Class targetClass) {
     return nil;
 }
 
+static id DSUnwrappedConversation(id conversation) {
+    if (!conversation) return nil;
+    id sdkConversation = DSSafeValue(conversation, @[@"con"]);
+    return sdkConversation ?: conversation;
+}
+
 @interface DSRuntimeBridge ()
 @property (nonatomic, strong) NSMutableDictionary<NSString *, DSConversationSnapshot *> *conversations;
 @property (nonatomic, strong) NSHashTable *friendModels;
@@ -341,13 +347,15 @@ static id DSSharedInstanceForClass(Class targetClass) {
         snapshot.displayName = displayName;
         snapshot.messages = messages;
         snapshot.controller = controller;
-        if (conversation) snapshot.conversationObject = conversation;
+        if (conversation) snapshot.conversationObject = DSUnwrappedConversation(conversation);
         self.conversations[conversationID] = snapshot;
     }
     [self recordDiagnostic:[NSString stringWithFormat:@"会话捕获：ID=%@ 控制器=%@ 会话对象=%@ 原始=%lu 文本=%lu",
                             conversationID,
                             NSStringFromClass([controller class]),
-                            conversation ? NSStringFromClass([conversation class]) : @"nil",
+                            conversation ? [NSString stringWithFormat:@"%@ -> %@",
+                                            NSStringFromClass([conversation class]),
+                                            NSStringFromClass([DSUnwrappedConversation(conversation) class])] : @"nil",
                             (unsigned long)rawMessages.count,
                             (unsigned long)messages.count]];
     return snapshot;
@@ -423,7 +431,7 @@ static id DSSharedInstanceForClass(Class targetClass) {
             id conversation = [self conversationForID:conversationID inMap:conversationMap];
             snapshot.conversationID = conversationID;
             snapshot.messages = messages;
-            if (conversation) snapshot.conversationObject = conversation;
+            if (conversation) snapshot.conversationObject = DSUnwrappedConversation(conversation);
             NSString *displayName = [self displayNameFromObject:conversation];
             if (!displayName.length) displayName = [self displayNameFromObject:raw];
             if (displayName.length) snapshot.displayName = displayName;
@@ -567,7 +575,13 @@ static id DSSharedInstanceForClass(Class targetClass) {
 
     id sendController = DSSafeValue(controller, @[@"sendMessageController", @"inputViewController.sendMessageController", @"messageViewModel.sendMessageController"]);
     if (!sendController) sendController = DSSharedInstanceForClass(objc_getClass("AWEIMSendMessageController"));
-    id conversationObject = conversation.conversationObject ?: DSSafeValue(controller, @[@"msg_conversation", @"currentConversation", @"conversation"]);
+    id rawConversationObject = conversation.conversationObject ?: DSSafeValue(controller, @[@"msg_conversation", @"currentConversation", @"conversation"]);
+    id conversationObject = DSUnwrappedConversation(rawConversationObject);
+    if (rawConversationObject && rawConversationObject != conversationObject) {
+        [self recordDiagnostic:[NSString stringWithFormat:@"解包会话对象：%@ -> %@",
+                                NSStringFromClass([rawConversationObject class]), NSStringFromClass([conversationObject class])]];
+        conversation.conversationObject = conversationObject;
+    }
     if ([self invokeSendController:sendController text:text conversation:conversationObject]) {
         self.recentOutgoingTexts[conversation.conversationID] = text;
         self.recentOutgoingDates[conversation.conversationID] = NSDate.date;
@@ -581,6 +595,7 @@ static id DSSharedInstanceForClass(Class targetClass) {
                             conversationObject ? NSStringFromClass([conversationObject class]) : @"nil"]];
 
     [self fetchConversation:conversation.conversationID completion:^(id fetchedConversation) {
+        fetchedConversation = DSUnwrappedConversation(fetchedConversation);
         if (fetchedConversation) conversation.conversationObject = fetchedConversation;
         Class senderClass = objc_getClass("AWEIMSendMessageController");
         id sender = DSSharedInstanceForClass(senderClass);
@@ -664,29 +679,33 @@ static id DSSharedInstanceForClass(Class targetClass) {
     @try {
         if ([sender respondsToSelector:selector]) {
             [self recordDiagnostic:[NSString stringWithFormat:@"调用发信选择器：%@ %@", NSStringFromClass([sender class]), NSStringFromSelector(selector)]];
-            ((void (*)(id, SEL, id, id, id, id))objc_msgSend)(sender, selector, message, conversation, nil, nil);
-            return YES;
+            id result = ((id (*)(id, SEL, id, id, BOOL, id))objc_msgSend)(sender, selector, message, conversation, NO, nil);
+            [self recordDiagnostic:[NSString stringWithFormat:@"发信选择器返回：%@", result ? NSStringFromClass([result class]) : @"nil"]];
+            return result != nil;
         }
 
         selector = NSSelectorFromString(@"sendMessage:conversation:forwardMessage:mentionUsers:enterFrom:");
         if ([sender respondsToSelector:selector]) {
             [self recordDiagnostic:[NSString stringWithFormat:@"调用发信选择器：%@ %@", NSStringFromClass([sender class]), NSStringFromSelector(selector)]];
-            ((void (*)(id, SEL, id, id, id, id, id))objc_msgSend)(sender, selector, message, conversation, nil, nil, @"DouyinDeepSeek");
-            return YES;
+            id result = ((id (*)(id, SEL, id, id, BOOL, id, id))objc_msgSend)(sender, selector, message, conversation, NO, nil, @"DouyinDeepSeek");
+            [self recordDiagnostic:[NSString stringWithFormat:@"发信选择器返回：%@", result ? NSStringFromClass([result class]) : @"nil"]];
+            return result != nil;
         }
 
         selector = NSSelectorFromString(@"sendMessage:conversation:");
         if ([sender respondsToSelector:selector]) {
             [self recordDiagnostic:[NSString stringWithFormat:@"调用发信选择器：%@ %@", NSStringFromClass([sender class]), NSStringFromSelector(selector)]];
-            ((void (*)(id, SEL, id, id))objc_msgSend)(sender, selector, message, conversation);
-            return YES;
+            id result = ((id (*)(id, SEL, id, id))objc_msgSend)(sender, selector, message, conversation);
+            [self recordDiagnostic:[NSString stringWithFormat:@"发信选择器返回：%@", result ? NSStringFromClass([result class]) : @"nil"]];
+            return result != nil;
         }
 
         selector = NSSelectorFromString(@"sendMessage:");
         if ([sender respondsToSelector:selector]) {
             [self recordDiagnostic:[NSString stringWithFormat:@"调用发信选择器：%@ %@", NSStringFromClass([sender class]), NSStringFromSelector(selector)]];
-            ((void (*)(id, SEL, id))objc_msgSend)(sender, selector, message);
-            return YES;
+            id result = ((id (*)(id, SEL, id))objc_msgSend)(sender, selector, message);
+            [self recordDiagnostic:[NSString stringWithFormat:@"发信选择器返回：%@", result ? NSStringFromClass([result class]) : @"nil"]];
+            return result != nil;
         }
     } @catch (NSException *exception) {
         [self recordDiagnostic:[NSString stringWithFormat:@"发信选择器异常：%@ / %@", exception.name, exception.reason ?: @"无原因"]];
@@ -708,7 +727,7 @@ static id DSSharedInstanceForClass(Class targetClass) {
     for (id target in @[utilityClass, sharedUtility ?: NSNull.null]) {
         if (target == NSNull.null || ![target respondsToSelector:syncSelector]) continue;
         id (*send)(id, SEL, id) = (id (*)(id, SEL, id))objc_msgSend;
-        id conversation = send(target, syncSelector, conversationID);
+        id conversation = DSUnwrappedConversation(send(target, syncSelector, conversationID));
         if (conversation) {
             [self recordDiagnostic:[NSString stringWithFormat:@"同步取得会话：target=%@ result=%@",
                                     object_isClass(target) ? NSStringFromClass(target) : NSStringFromClass([target class]),
@@ -729,8 +748,11 @@ static id DSSharedInstanceForClass(Class targetClass) {
     [self recordDiagnostic:@"同步取会话为空，调用异步取会话"];
     void (^callback)(id) = ^(id fetched) {
         dispatch_async(dispatch_get_main_queue(), ^{
-            [self recordDiagnostic:[NSString stringWithFormat:@"异步取会话结果：%@", fetched ? NSStringFromClass([fetched class]) : @"nil"]];
-            completion(fetched);
+            id unwrapped = DSUnwrappedConversation(fetched);
+            [self recordDiagnostic:[NSString stringWithFormat:@"异步取会话结果：%@ -> %@",
+                                    fetched ? NSStringFromClass([fetched class]) : @"nil",
+                                    unwrapped ? NSStringFromClass([unwrapped class]) : @"nil"]];
+            completion(unwrapped);
         });
     };
     NSMethodSignature *signature = [target methodSignatureForSelector:selector];
@@ -795,7 +817,7 @@ static id DSSharedInstanceForClass(Class targetClass) {
 
     NSMutableString *report = [NSMutableString string];
     [report appendString:@"DouyinDeepSeek 运行报错\n"];
-    [report appendString:@"插件版本：0.1.8\n"];
+    [report appendString:@"插件版本：0.1.9\n"];
     [report appendFormat:@"抖音版本：%@ (%@)\n", appVersion, appBuild];
     [report appendFormat:@"系统：iOS %@ / %@\n", UIDevice.currentDevice.systemVersion, UIDevice.currentDevice.model];
     [report appendFormat:@"兼容性：%@\n", [self compatibilitySummary]];
