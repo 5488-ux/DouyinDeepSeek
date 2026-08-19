@@ -9,6 +9,7 @@
 
 static const NSInteger DSSettingsButtonTag = 0x44534149;
 static const void *DSSettingsInjectedKey = &DSSettingsInjectedKey;
+static NSMapTable *DSSettingsOriginalImplementations;
 
 static BOOL DSHookInstanceMethod(Class targetClass, SEL selector, IMP replacement, IMP *original) {
     if (!targetClass || !selector || !replacement) return NO;
@@ -23,6 +24,47 @@ static BOOL DSHookInstanceMethod(Class targetClass, SEL selector, IMP replacemen
     }
     if (original) *original = previous;
     return previous != NULL;
+}
+
+static void DSEnsureSettingsOriginals(void) {
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        DSSettingsOriginalImplementations = [NSMapTable weakToStrongObjectsMapTable];
+    });
+}
+
+static IMP DSOriginalSettingsViewDidAppear(Class targetClass) {
+    DSEnsureSettingsOriginals();
+    @synchronized (DSSettingsOriginalImplementations) {
+        return [[DSSettingsOriginalImplementations objectForKey:targetClass] pointerValue];
+    }
+}
+
+static BOOL DSIsSettingsViewControllerClass(Class targetClass) {
+    if (!targetClass) return NO;
+    NSString *name = NSStringFromClass(targetClass);
+    if (![name hasPrefix:@"AWE"] || [name rangeOfString:@"Setting" options:NSCaseInsensitiveSearch].location == NSNotFound) return NO;
+    if (![targetClass isSubclassOfClass:UIViewController.class]) return NO;
+    return class_getInstanceMethod(targetClass, @selector(viewDidAppear:)) != NULL;
+}
+
+static void DSOpenSettings(id self, SEL _cmd);
+static void DSNewSettingsViewDidAppear(id self, SEL _cmd, BOOL animated);
+
+static BOOL DSInstallSettingsHookForClass(Class targetClass) {
+    if (!DSIsSettingsViewControllerClass(targetClass)) return NO;
+    class_addMethod(targetClass, NSSelectorFromString(@"ds_openDeepSeekSettings"), (IMP)DSOpenSettings, "v@:");
+    DSEnsureSettingsOriginals();
+    @synchronized (DSSettingsOriginalImplementations) {
+        if ([DSSettingsOriginalImplementations objectForKey:targetClass]) return YES;
+    }
+
+    IMP original = NULL;
+    if (!DSHookInstanceMethod(targetClass, @selector(viewDidAppear:), (IMP)DSNewSettingsViewDidAppear, &original)) return NO;
+    @synchronized (DSSettingsOriginalImplementations) {
+        [DSSettingsOriginalImplementations setObject:[NSValue valueWithPointer:original] forKey:targetClass];
+    }
+    return YES;
 }
 
 @interface DSAutoReplyEngine : NSObject
@@ -200,7 +242,12 @@ static void DSInjectSettingsButton(UIViewController *controller) {
 
 static void (*DSOldSettingsViewDidAppear)(id, SEL, BOOL);
 static void DSNewSettingsViewDidAppear(id self, SEL _cmd, BOOL animated) {
-    DSOldSettingsViewDidAppear(self, _cmd, animated);
+    IMP original = DSOriginalSettingsViewDidAppear(object_getClass(self));
+    if (original) {
+        ((void (*)(id, SEL, BOOL))original)(self, _cmd, animated);
+    } else if (DSOldSettingsViewDidAppear) {
+        DSOldSettingsViewDidAppear(self, _cmd, animated);
+    }
     DSInjectSettingsButton((UIViewController *)self);
 }
 
@@ -232,10 +279,18 @@ static void DSInstallHooks(void) {
     Class settingsClass = objc_getClass("AWESettingBaseViewController");
     if (settingsClass && !DSSettingsHooked) {
         class_addMethod(settingsClass, NSSelectorFromString(@"ds_openDeepSeekSettings"), (IMP)DSOpenSettings, "v@:");
-        Method method = class_getInstanceMethod(settingsClass, @selector(viewDidAppear:));
-        if (method) {
-            DSSettingsHooked = DSHookInstanceMethod(settingsClass, @selector(viewDidAppear:), (IMP)DSNewSettingsViewDidAppear, (IMP *)&DSOldSettingsViewDidAppear);
+        DSSettingsHooked = DSInstallSettingsHookForClass(settingsClass);
+    }
+
+    int classCount = objc_getClassList(NULL, 0);
+    if (classCount > 0) {
+        Class *classes = (__unsafe_unretained Class *)calloc((size_t)classCount, sizeof(Class));
+        classCount = objc_getClassList(classes, classCount);
+        for (int index = 0; index < classCount; index++) {
+            Class candidate = classes[index];
+            if (DSInstallSettingsHookForClass(candidate)) DSSettingsHooked = YES;
         }
+        free(classes);
     }
 
     Class messageClass = objc_getClass("AWEIMMessageListViewController");
