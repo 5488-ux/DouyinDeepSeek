@@ -1,4 +1,4 @@
-ARCHS = arm64 arm64e
+ARCHS = arm64
 TARGET = iphone:clang:latest:14.0
 THEOS_PACKAGE_SCHEME ?= rootless
 
@@ -20,4 +20,3 @@ DouyinDeepSeek_LIBRARIES = substrate
 INSTALL_TARGET_PROCESSES = Aweme
 
 include $(THEOS_MAKE_PATH)/tweak.mk
-

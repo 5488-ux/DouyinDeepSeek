@@ -16,6 +16,7 @@
 - 跳过自己发出的消息，同一会话防重复、串行生成并带冷却时间。
 - 生成或冷却期间到达的新消息会保留为待处理消息，不再提前吞掉。
 - 发信链路按参考插件使用 `AWEIMShareMessageCreater.sharedInstance` 和 `AWEIMSendMessageController.sharedInstance`。
+- 工程面向抖音这种普通 App Store App 只编译 `arm64`，避免 Linux 云工具链产出带不兼容 ABI 警告的 `arm64e` slice。
 - 同时云编译 rootless 与 rootful 两种 `.deb`。
 
 ## 参考 dylib 得到的兼容点
