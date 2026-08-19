@@ -4,8 +4,8 @@
 
 ## 已实现
 
-- 抖音设置页右上角增加 DeepSeek 入口。
-- 设置入口会扫描当前版本实际加载的 `AWE*Setting*ViewController`，不再只依赖单个写死类名。
+- 像参考插件一样在抖音设置列表顶部增加 `DeepSeek AI` 独立分组和设置行。
+- 设置入口直接 Hook `AWESettingsViewModel.sectionDataArray`，使用 `AWESettingItemModel` 与 `AWESettingSectionModel` 构建，不再依赖导航栏按钮。
 - 总开关，可随时关闭自动回复。
 - DeepSeek API Key 使用 iOS Keychain 保存，不写进源码、GitHub 或偏好 plist。
 - API 地址、模型、思考模式、最大回复 Token 可配置。
@@ -46,7 +46,7 @@
    - `DouyinDeepSeek-rootful`：传统 rootful 环境。
    - `DouyinDeepSeek-AllSign`：解压后把 `DouyinDeepSeek-AllSign.dylib` 注入抖音 IPA，再签名安装。
 4. 用 Sileo、Zebra、Filza 或 `dpkg -i` 安装 `.deb`，然后彻底结束并重开抖音。
-5. 进入抖音设置页，点右上角脑袋图标（旧系统显示 `AI`）。
+5. 进入抖音设置页，点击顶部的 `DeepSeek AI` 设置行。
 6. 填写 API Key，先点“测试 DeepSeek API”。
 7. 依次打开几个目标联系人的私信，让插件记录其上下文。
 8. 回到插件设置，点“测试发话”，选择联系人。插件会结合上下文生成并提交给抖音发信接口；返回聊天确认消息真实送达。

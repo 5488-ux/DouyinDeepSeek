@@ -1,15 +1,12 @@
 #import <UIKit/UIKit.h>
 #import <Foundation/Foundation.h>
+#import <objc/message.h>
 #import <objc/runtime.h>
 
 #import "Sources/DSConfig.h"
 #import "Sources/DSDeepSeekClient.h"
 #import "Sources/DSRuntimeBridge.h"
 #import "Sources/DSSettingsViewController.h"
-
-static const NSInteger DSSettingsButtonTag = 0x44534149;
-static const void *DSSettingsInjectedKey = &DSSettingsInjectedKey;
-static NSMapTable *DSSettingsOriginalImplementations;
 
 static BOOL DSHookInstanceMethod(Class targetClass, SEL selector, IMP replacement, IMP *original) {
     if (!targetClass || !selector || !replacement) return NO;
@@ -24,50 +21,6 @@ static BOOL DSHookInstanceMethod(Class targetClass, SEL selector, IMP replacemen
     }
     if (original) *original = previous;
     return previous != NULL;
-}
-
-static void DSEnsureSettingsOriginals(void) {
-    static dispatch_once_t onceToken;
-    dispatch_once(&onceToken, ^{
-        DSSettingsOriginalImplementations = [NSMapTable weakToStrongObjectsMapTable];
-    });
-}
-
-static IMP DSOriginalSettingsViewDidAppear(Class targetClass) {
-    DSEnsureSettingsOriginals();
-    @synchronized (DSSettingsOriginalImplementations) {
-        NSValue *value = [DSSettingsOriginalImplementations objectForKey:targetClass];
-        IMP implementation = NULL;
-        if (value) [value getValue:&implementation];
-        return implementation;
-    }
-}
-
-static BOOL DSIsSettingsViewControllerClass(Class targetClass) {
-    if (!targetClass) return NO;
-    NSString *name = NSStringFromClass(targetClass);
-    if (![name hasPrefix:@"AWE"] || [name rangeOfString:@"Setting" options:NSCaseInsensitiveSearch].location == NSNotFound) return NO;
-    if (![targetClass isSubclassOfClass:UIViewController.class]) return NO;
-    return class_getInstanceMethod(targetClass, @selector(viewDidAppear:)) != NULL;
-}
-
-static void DSOpenSettings(id self, SEL _cmd);
-static void DSNewSettingsViewDidAppear(id self, SEL _cmd, BOOL animated);
-
-static BOOL DSInstallSettingsHookForClass(Class targetClass) {
-    if (!DSIsSettingsViewControllerClass(targetClass)) return NO;
-    class_addMethod(targetClass, NSSelectorFromString(@"ds_openDeepSeekSettings"), (IMP)DSOpenSettings, "v@:");
-    DSEnsureSettingsOriginals();
-    @synchronized (DSSettingsOriginalImplementations) {
-        if ([DSSettingsOriginalImplementations objectForKey:targetClass]) return YES;
-    }
-
-    IMP original = NULL;
-    if (!DSHookInstanceMethod(targetClass, @selector(viewDidAppear:), (IMP)DSNewSettingsViewDidAppear, &original)) return NO;
-    @synchronized (DSSettingsOriginalImplementations) {
-        [DSSettingsOriginalImplementations setObject:[NSValue valueWithBytes:&original objCType:@encode(IMP)] forKey:targetClass];
-    }
-    return YES;
 }
 
 @interface DSAutoReplyEngine : NSObject
@@ -212,46 +165,112 @@ static BOOL DSInstallSettingsHookForClass(Class targetClass) {
 
 @end
 
-static void DSOpenSettings(id self, SEL _cmd) {
+static UIViewController *DSTopViewController(void) {
+    UIWindow *window = nil;
+    for (UIWindow *candidate in UIApplication.sharedApplication.windows) {
+        if (candidate.isKeyWindow) { window = candidate; break; }
+    }
+    if (!window) window = UIApplication.sharedApplication.windows.firstObject;
+    UIViewController *controller = window.rootViewController;
+    while (controller.presentedViewController) controller = controller.presentedViewController;
+    if ([controller isKindOfClass:UINavigationController.class]) {
+        controller = ((UINavigationController *)controller).topViewController;
+    } else if ([controller isKindOfClass:UITabBarController.class]) {
+        controller = ((UITabBarController *)controller).selectedViewController;
+        if ([controller isKindOfClass:UINavigationController.class]) {
+            controller = ((UINavigationController *)controller).topViewController;
+        }
+    }
+    return controller;
+}
+
+static void DSOpenSettingsFromController(UIViewController *controller) {
     DSSettingsViewController *settings = [[DSSettingsViewController alloc] initWithStyle:UITableViewStyleInsetGrouped];
-    UINavigationController *navigation = nil;
-    if ([self isKindOfClass:UIViewController.class]) navigation = [(UIViewController *)self navigationController];
+    UINavigationController *navigation = controller.navigationController;
     if (navigation) {
         [navigation pushViewController:settings animated:YES];
-    } else if ([self isKindOfClass:UIViewController.class]) {
+    } else if (controller) {
         UINavigationController *wrapper = [[UINavigationController alloc] initWithRootViewController:settings];
-        [(UIViewController *)self presentViewController:wrapper animated:YES completion:nil];
+        [controller presentViewController:wrapper animated:YES completion:nil];
     }
 }
 
-static void DSInjectSettingsButton(UIViewController *controller) {
-    if (!controller || objc_getAssociatedObject(controller, DSSettingsInjectedKey)) return;
-    objc_setAssociatedObject(controller, DSSettingsInjectedKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-
-    UIImage *image = nil;
-    if (@available(iOS 13.0, *)) image = [UIImage systemImageNamed:@"brain.head.profile"];
-    UIBarButtonItem *item = image
-        ? [[UIBarButtonItem alloc] initWithImage:image style:UIBarButtonItemStylePlain target:controller action:NSSelectorFromString(@"ds_openDeepSeekSettings")]
-        : [[UIBarButtonItem alloc] initWithTitle:@"AI" style:UIBarButtonItemStylePlain target:controller action:NSSelectorFromString(@"ds_openDeepSeekSettings")];
-    item.tag = DSSettingsButtonTag;
-    item.accessibilityLabel = @"DeepSeek 自动回复";
-
-    NSMutableArray *items = [controller.navigationItem.rightBarButtonItems mutableCopy] ?: [NSMutableArray array];
-    BOOL exists = NO;
-    for (UIBarButtonItem *oldItem in items) if (oldItem.tag == DSSettingsButtonTag) exists = YES;
-    if (!exists) [items insertObject:item atIndex:0];
-    controller.navigationItem.rightBarButtonItems = items;
+static void DSSetObjectSettingValue(id target, NSString *selectorName, id value) {
+    SEL selector = NSSelectorFromString(selectorName);
+    if (![target respondsToSelector:selector]) return;
+    ((void (*)(id, SEL, id))objc_msgSend)(target, selector, value);
 }
 
-static void (*DSOldSettingsViewDidAppear)(id, SEL, BOOL);
-static void DSNewSettingsViewDidAppear(id self, SEL _cmd, BOOL animated) {
-    IMP original = DSOriginalSettingsViewDidAppear(object_getClass(self));
-    if (original) {
-        ((void (*)(id, SEL, BOOL))original)(self, _cmd, animated);
-    } else if (DSOldSettingsViewDidAppear) {
-        DSOldSettingsViewDidAppear(self, _cmd, animated);
+static void DSSetIntegerSettingValue(id target, NSString *selectorName, NSInteger value) {
+    SEL selector = NSSelectorFromString(selectorName);
+    if (![target respondsToSelector:selector]) return;
+    ((void (*)(id, SEL, NSInteger))objc_msgSend)(target, selector, value);
+}
+
+static void DSSetBoolSettingValue(id target, NSString *selectorName, BOOL value) {
+    SEL selector = NSSelectorFromString(selectorName);
+    if (![target respondsToSelector:selector]) return;
+    ((void (*)(id, SEL, BOOL))objc_msgSend)(target, selector, value);
+}
+
+static void DSSetDoubleSettingValue(id target, NSString *selectorName, double value) {
+    SEL selector = NSSelectorFromString(selectorName);
+    if (![target respondsToSelector:selector]) return;
+    ((void (*)(id, SEL, double))objc_msgSend)(target, selector, value);
+}
+
+static NSString *DSSettingSectionTitle(id section) {
+    SEL selector = NSSelectorFromString(@"sectionHeaderTitle");
+    if (![section respondsToSelector:selector]) return nil;
+    id value = ((id (*)(id, SEL))objc_msgSend)(section, selector);
+    return [value isKindOfClass:NSString.class] ? value : nil;
+}
+
+static id (*DSOldSectionDataArray)(id, SEL);
+static id DSNewSectionDataArray(id self, SEL _cmd) {
+    NSArray *original = DSOldSectionDataArray ? DSOldSectionDataArray(self, _cmd) : nil;
+    if (![original isKindOfClass:NSArray.class]) return original;
+
+    for (id section in original) {
+        NSString *title = DSSettingSectionTitle(section);
+        if ([title isEqualToString:@"DeepSeek AI"]) return original;
     }
-    DSInjectSettingsButton((UIViewController *)self);
+
+    Class itemClass = objc_getClass("AWESettingItemModel");
+    Class sectionClass = objc_getClass("AWESettingSectionModel");
+    if (!itemClass || !sectionClass) return original;
+
+    id item = [[itemClass alloc] init];
+    DSSetObjectSettingValue(item, @"setIdentifier:", @"DouyinDeepSeek");
+    DSSetObjectSettingValue(item, @"setTitle:", @"DeepSeek AI");
+    DSSetObjectSettingValue(item, @"setDetail:", @"0.1.4");
+    DSSetIntegerSettingValue(item, @"setType:", 0);
+    DSSetObjectSettingValue(item, @"setSvgIconImageName:", @"ic_module_outlined_20");
+    DSSetIntegerSettingValue(item, @"setCellType:", 26);
+    DSSetIntegerSettingValue(item, @"setColorStyle:", 2);
+    DSSetBoolSettingValue(item, @"setIsEnable:", YES);
+
+    void (^tapBlock)(void) = ^{
+        dispatch_async(dispatch_get_main_queue(), ^{
+            DSOpenSettingsFromController(DSTopViewController());
+        });
+    };
+    DSSetObjectSettingValue(item, @"setCellTappedBlock:", [tapBlock copy]);
+
+    id section = [[sectionClass alloc] init];
+    DSSetObjectSettingValue(section, @"setItemArray:", @[item]);
+    DSSetIntegerSettingValue(section, @"setType:", 0);
+    DSSetDoubleSettingValue(section, @"setSectionHeaderHeight:", 40.0);
+    DSSetObjectSettingValue(section, @"setSectionHeaderTitle:", @"DeepSeek AI");
+
+    NSMutableArray *result = [NSMutableArray arrayWithArray:original];
+    [result insertObject:section atIndex:0];
+    return result;
+}
+
+static BOOL (*DSOldUseCardUIStyle)(id, SEL);
+static BOOL DSNewUseCardUIStyle(id self, SEL _cmd) {
+    return YES;
 }
 
 static void (*DSOldMessageViewDidAppear)(id, SEL, BOOL);
@@ -274,26 +293,26 @@ static id DSNewFriendInit(id self, SEL _cmd, id user) {
 }
 
 static BOOL DSSettingsHooked = NO;
+static BOOL DSCardStyleHooked = NO;
 static BOOL DSMessageHooked = NO;
 static BOOL DSReloadHooked = NO;
 static BOOL DSFriendHooked = NO;
 
 static void DSInstallHooks(void) {
     Class settingsClass = objc_getClass("AWESettingBaseViewController");
-    if (settingsClass && !DSSettingsHooked) {
-        class_addMethod(settingsClass, NSSelectorFromString(@"ds_openDeepSeekSettings"), (IMP)DSOpenSettings, "v@:");
-        DSSettingsHooked = DSInstallSettingsHookForClass(settingsClass);
+    if (settingsClass && !DSCardStyleHooked) {
+        SEL selector = NSSelectorFromString(@"useCardUIStyle");
+        if (class_getInstanceMethod(settingsClass, selector)) {
+            DSCardStyleHooked = DSHookInstanceMethod(settingsClass, selector, (IMP)DSNewUseCardUIStyle, (IMP *)&DSOldUseCardUIStyle);
+        }
     }
 
-    int classCount = objc_getClassList(NULL, 0);
-    if (classCount > 0) {
-        Class *classes = (__unsafe_unretained Class *)calloc((size_t)classCount, sizeof(Class));
-        classCount = objc_getClassList(classes, classCount);
-        for (int index = 0; index < classCount; index++) {
-            Class candidate = classes[index];
-            if (DSInstallSettingsHookForClass(candidate)) DSSettingsHooked = YES;
+    Class settingsViewModelClass = objc_getClass("AWESettingsViewModel");
+    if (settingsViewModelClass && !DSSettingsHooked) {
+        SEL selector = NSSelectorFromString(@"sectionDataArray");
+        if (class_getInstanceMethod(settingsViewModelClass, selector)) {
+            DSSettingsHooked = DSHookInstanceMethod(settingsViewModelClass, selector, (IMP)DSNewSectionDataArray, (IMP *)&DSOldSectionDataArray);
         }
-        free(classes);
     }
 
     Class messageClass = objc_getClass("AWEIMMessageListViewController");
