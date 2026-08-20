@@ -48,9 +48,9 @@ typedef NS_ENUM(NSInteger, DSSettingsSection) {
 }
 
 - (NSString *)tableView:(UITableView *)tableView titleForFooterInSection:(NSInteger)section {
-    if (section == DSSettingsSectionMaster) return @"首次看到一个会话时只记录最后消息，不会突然翻旧账自动回复。";
+    if (section == DSSettingsSectionMaster) return @"监听全局新私信；即使没有进入聊天框，也会先从抖音本地消息库加载该会话历史，再结合上下文回复。";
     if (section == DSSettingsSectionReply) return @"每条上下文都会明确标注“谁说的”。我的称呼代表账号主人；联系人名称自动取当前抖音昵称。图片、语音等非文本消息暂不送给模型。";
-    if (section == DSSettingsSectionTest) return @"测试发话会在选中联系人后生成并交给抖音发信接口。请先打开目标聊天一次；接口调用成功后仍需回到聊天确认真实送达。";
+    if (section == DSSettingsSectionTest) return @"测试发话会在后台加载选中联系人的历史、生成并交给抖音发信接口，不再要求先打开目标聊天。";
     return nil;
 }
 
@@ -227,24 +227,33 @@ typedef NS_ENUM(NSInteger, DSSettingsSection) {
 }
 
 - (void)runTestForConversation:(DSConversationSnapshot *)conversation {
-    NSArray *messages = [[DSRuntimeBridge shared] apiMessagesForConversation:conversation];
-    if (!conversation.messages.count) {
-        [self showResultTitle:@"没有上下文" message:@"先打开这个人的聊天，等消息显示出来，再回来点测试发话。不能没上下文硬生成。"];
-        return;
-    }
-    [self setBusy:YES title:[NSString stringWithFormat:@"正在结合 %@ 的上下文生成…", conversation.displayName]];
-    [[DSDeepSeekClient shared] generateReplyWithMessages:messages conversationID:conversation.conversationID completion:^(NSString *reply, NSError *error) {
+    [self setBusy:YES title:[NSString stringWithFormat:@"正在后台读取 %@ 的完整上下文…", conversation.displayName]];
+    [[DSRuntimeBridge shared] hydrateConversation:conversation completion:^(DSConversationSnapshot *fresh, NSError *hydrateError) {
+        if (hydrateError || !fresh.historyHydrated) {
+            [self setBusy:NO title:nil];
+            [self showResultTitle:@"上下文加载失败" message:hydrateError.localizedDescription ?: @"抖音本地消息库没有返回历史，已停止生成。"];
+            return;
+        }
+        if (!fresh.directConversation) {
+            [self setBusy:NO title:nil];
+            [self showResultTitle:@"暂不支持群聊" message:@"自动回复当前只处理一对一私信，避免把群里不同的人混成一个联系人。"];
+            return;
+        }
+        NSArray *messages = [[DSRuntimeBridge shared] apiMessagesForConversation:fresh];
+        [self setBusy:YES title:[NSString stringWithFormat:@"正在结合 %@ 的完整上下文生成…", fresh.displayName]];
+        [[DSDeepSeekClient shared] generateReplyWithMessages:messages conversationID:fresh.conversationID completion:^(NSString *reply, NSError *error) {
         if (error) {
             [self setBusy:NO title:nil];
             [self showResultTitle:@"生成失败" message:error.localizedDescription];
             return;
         }
-        [[DSRuntimeBridge shared] sendText:reply toConversation:conversation completion:^(BOOL success, NSError *sendError) {
+        [[DSRuntimeBridge shared] sendText:reply toConversation:fresh completion:^(BOOL success, NSError *sendError) {
             [self setBusy:NO title:nil];
             NSString *title = success ? @"已确认消息出现在会话中" : @"生成成功，但真实发信失败";
-            NSString *message = success ? [NSString stringWithFormat:@"目标：%@\n\n%@", conversation.displayName, reply] : [NSString stringWithFormat:@"已生成：%@\n\n发信错误：%@\n\n点下面的“复制报错”，把完整内容发给开发者。", reply, sendError.localizedDescription];
-            NSString *report = success ? nil : [[DSRuntimeBridge shared] diagnosticReportForConversation:conversation];
+            NSString *message = success ? [NSString stringWithFormat:@"目标：%@\n\n%@", fresh.displayName, reply] : [NSString stringWithFormat:@"已生成：%@\n\n发信错误：%@\n\n点下面的“复制报错”，把完整内容发给开发者。", reply, sendError.localizedDescription];
+            NSString *report = success ? nil : [[DSRuntimeBridge shared] diagnosticReportForConversation:fresh];
             [self showResultTitle:title message:message copyText:report];
+        }];
         }];
     }];
 }

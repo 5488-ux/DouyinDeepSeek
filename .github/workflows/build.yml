@@ -15,6 +15,9 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v6
 
+      - name: Run release contract tests
+        run: python3 -m unittest discover -s tests -p "test_*.py" -v
+
       - name: Prepare Theos and iOS SDK
         uses: Randomblock1/theos-action@v1
 
@@ -27,6 +30,12 @@ jobs:
           make clean package FINALPACKAGE=1 THEOS_PACKAGE_SCHEME=
           cp packages/*.deb artifact/rootful/
           cp .theos/obj/DouyinDeepSeek.dylib artifact/fullsign/DouyinDeepSeek-AllSign.dylib
+
+      - name: Verify package versions
+        run: |
+          expected="$(awk '/^Version:/{print $2}' control)"
+          test "$(dpkg-deb -f artifact/rootless/*.deb Version)" = "$expected"
+          test "$(dpkg-deb -f artifact/rootful/*.deb Version)" = "$expected"
 
       - name: Upload rootless package
         uses: actions/upload-artifact@v7

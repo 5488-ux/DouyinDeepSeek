@@ -3,6 +3,7 @@
 #import <objc/message.h>
 #import <objc/runtime.h>
 #import <math.h>
+#import <float.h>
 
 #import "Sources/DSConfig.h"
 #import "Sources/DSDeepSeekClient.h"
@@ -39,6 +40,10 @@ static BOOL DSHookInstanceMethod(Class targetClass, SEL selector, IMP replacemen
 @property (nonatomic, strong) NSMutableSet<NSString *> *busyConversationIDs;
 @property (nonatomic, strong) NSHashTable *controllers;
 @property (nonatomic, strong) NSTimer *pollTimer;
+@property (nonatomic, strong) NSMutableDictionary<NSString *, NSNumber *> *retryCounts;
+@property (nonatomic, strong) NSMutableDictionary<NSString *, NSString *> *wakeupTokens;
+@property (nonatomic, strong) NSMutableDictionary<NSString *, NSString *> *generatedReplies;
+@property (nonatomic, strong) NSMutableSet<NSString *> *processedMessageIDs;
 @end
 
 @implementation DSAutoReplyEngine
@@ -53,6 +58,11 @@ static BOOL DSHookInstanceMethod(Class targetClass, SEL selector, IMP replacemen
         engine.lastReplyDates = [NSMutableDictionary dictionary];
         engine.busyConversationIDs = [NSMutableSet set];
         engine.controllers = [NSHashTable weakObjectsHashTable];
+        engine.retryCounts = [NSMutableDictionary dictionary];
+        engine.wakeupTokens = [NSMutableDictionary dictionary];
+        engine.generatedReplies = [NSMutableDictionary dictionary];
+        NSArray *stored = [[NSUserDefaults standardUserDefaults] arrayForKey:@"DouyinDeepSeek.processedMessageIDs"];
+        engine.processedMessageIDs = [NSMutableSet setWithArray:[stored isKindOfClass:NSArray.class] ? stored : @[]];
     });
     return engine;
 }
@@ -65,8 +75,62 @@ static BOOL DSHookInstanceMethod(Class targetClass, SEL selector, IMP replacemen
         if (!strongEngine) return;
         NSArray *controllers;
         @synchronized (strongEngine.controllers) { controllers = strongEngine.controllers.allObjects; }
-        for (id controller in controllers) [strongEngine observeController:controller];
+        for (id controller in controllers) {
+            if (![controller isKindOfClass:UIViewController.class] || ((UIViewController *)controller).viewIfLoaded.window) {
+                [strongEngine observeController:controller];
+            }
+        }
+        for (NSString *conversationID in strongEngine.pendingMessageIDs.allKeys.copy) {
+            DSConversationSnapshot *snapshot = [[DSRuntimeBridge shared] conversationForID:conversationID];
+            if (snapshot) [strongEngine processPendingConversation:snapshot];
+        }
     }];
+}
+
+- (void)markProcessedMessageID:(NSString *)messageID {
+    if (!messageID.length) return;
+    [self.processedMessageIDs addObject:messageID];
+    NSArray *all = self.processedMessageIDs.allObjects;
+    if (all.count > 300) all = [all subarrayWithRange:NSMakeRange(all.count - 300, 300)];
+    self.processedMessageIDs = [NSMutableSet setWithArray:all];
+    [[NSUserDefaults standardUserDefaults] setObject:all forKey:@"DouyinDeepSeek.processedMessageIDs"];
+}
+
+- (NSString *)retryKeyForConversationID:(NSString *)conversationID messageID:(NSString *)messageID {
+    return [NSString stringWithFormat:@"%@|%@", conversationID ?: @"", messageID ?: @""];
+}
+
+- (void)scheduleRetryForConversationID:(NSString *)conversationID
+                             messageID:(NSString *)messageID
+                                 delay:(NSTimeInterval)delay
+                        increaseCount:(BOOL)increaseCount {
+    if (!conversationID.length || !messageID.length) return;
+    NSString *retryKey = [self retryKeyForConversationID:conversationID messageID:messageID];
+    NSInteger count = [self.retryCounts[retryKey] integerValue];
+    if (increaseCount) count++;
+    if (count > 3) {
+        NSLog(@"[DouyinDeepSeek] retry exhausted for %@", retryKey);
+        return;
+    }
+    self.retryCounts[retryKey] = @(count);
+    NSString *token = NSUUID.UUID.UUIDString;
+    self.wakeupTokens[conversationID] = token;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(MAX(0.5, delay) * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        if (![self.wakeupTokens[conversationID] isEqualToString:token]) return;
+        if (![self.pendingMessageIDs[conversationID] isEqualToString:messageID]) return;
+        [self.wakeupTokens removeObjectForKey:conversationID];
+        DSConversationSnapshot *snapshot = [[DSRuntimeBridge shared] conversationForID:conversationID];
+        if (snapshot) [self processPendingConversation:snapshot];
+    });
+}
+
+- (void)clearPendingConversationID:(NSString *)conversationID messageID:(NSString *)messageID {
+    if ([self.pendingMessageIDs[conversationID] isEqualToString:messageID]) {
+        [self.pendingMessageIDs removeObjectForKey:conversationID];
+    }
+    [self.wakeupTokens removeObjectForKey:conversationID];
+    [self.generatedReplies removeObjectForKey:[self retryKeyForConversationID:conversationID messageID:messageID]];
+    [self.retryCounts removeObjectForKey:[self retryKeyForConversationID:conversationID messageID:messageID]];
 }
 
 - (void)observeController:(id)controller {
@@ -87,7 +151,7 @@ static BOOL DSHookInstanceMethod(Class targetClass, SEL selector, IMP replacemen
 
     if (![previousMessageID isEqualToString:latest.messageID]) {
         self.lastSeenMessageIDs[conversation.conversationID] = latest.messageID;
-        if (latest.outgoing || !latest.text.length) {
+        if (latest.direction != DSMessageDirectionIncoming || !latest.text.length) {
             // 用户自己已经回复时，不再补发旧的 AI 回复。
             [self.pendingMessageIDs removeObjectForKey:conversation.conversationID];
             return;
@@ -110,7 +174,7 @@ static BOOL DSHookInstanceMethod(Class targetClass, SEL selector, IMP replacemen
     self.lastSeenMessageIDs[conversation.conversationID] = latest.messageID;
     if ([previousMessageID isEqualToString:latest.messageID]) return;
 
-    if (latest.outgoing || !latest.text.length) {
+    if (latest.direction != DSMessageDirectionIncoming || !latest.text.length) {
         [self.pendingMessageIDs removeObjectForKey:conversation.conversationID];
         return;
     }
@@ -118,6 +182,7 @@ static BOOL DSHookInstanceMethod(Class targetClass, SEL selector, IMP replacemen
     // 全局消息创建回调只处理刚收到的消息，额外挡住异常历史回放。
     NSTimeInterval age = fabs(NSDate.date.timeIntervalSince1970 - latest.timestamp);
     if (latest.timestamp > 0 && age > 300) return;
+    if ([self.processedMessageIDs containsObject:latest.messageID]) return;
 
     DSConfig *config = [DSConfig shared];
     if (config.enabled && config.apiKey.length) {
@@ -133,58 +198,88 @@ static BOOL DSHookInstanceMethod(Class targetClass, SEL selector, IMP replacemen
 
     DSConfig *config = [DSConfig shared];
     if (!config.enabled || !config.apiKey.length) {
-        [self.pendingMessageIDs removeObjectForKey:conversationID];
+        [self clearPendingConversationID:conversationID messageID:pendingMessageID];
+        return;
+    }
+    if (!conversation.directConversation) {
+        [self clearPendingConversationID:conversationID messageID:pendingMessageID];
+        NSLog(@"[DouyinDeepSeek] skip non-direct conversation %@", conversationID);
         return;
     }
     if ([self.busyConversationIDs containsObject:conversationID]) return;
 
     NSDate *lastReplyDate = self.lastReplyDates[conversationID];
-    if (lastReplyDate && -lastReplyDate.timeIntervalSinceNow < config.cooldown) return;
-
-    NSArray *context = [[DSRuntimeBridge shared] apiMessagesForConversation:conversation];
-    if (!conversation.messages.count) return;
+    NSTimeInterval elapsed = lastReplyDate ? -lastReplyDate.timeIntervalSinceNow : DBL_MAX;
+    if (elapsed < config.cooldown) {
+        [self scheduleRetryForConversationID:conversationID
+                                   messageID:pendingMessageID
+                                       delay:config.cooldown - elapsed + 0.2
+                              increaseCount:NO];
+        return;
+    }
 
     NSString *processingMessageID = [pendingMessageID copy];
     [self.busyConversationIDs addObject:conversationID];
-    [[DSDeepSeekClient shared] generateReplyWithMessages:context conversationID:conversationID completion:^(NSString *reply, NSError *error) {
-        if (error || !reply.length) {
-            NSLog(@"[DouyinDeepSeek] generation failed for %@: %@", conversationID, error.localizedDescription);
-            if ([self.pendingMessageIDs[conversationID] isEqualToString:processingMessageID]) {
-                [self.pendingMessageIDs removeObjectForKey:conversationID];
-            }
+    [[DSRuntimeBridge shared] hydrateConversation:conversation completion:^(DSConversationSnapshot *fresh, NSError *hydrateError) {
+        if (hydrateError || !fresh.historyHydrated) {
             [self.busyConversationIDs removeObject:conversationID];
-            DSConversationSnapshot *newer = [[DSRuntimeBridge shared] conversationForID:conversationID];
-            if (newer) [self processPendingConversation:newer];
-            return;
-        }
-        if (![DSConfig shared].enabled) {
-            if ([self.pendingMessageIDs[conversationID] isEqualToString:processingMessageID]) {
-                [self.pendingMessageIDs removeObjectForKey:conversationID];
-            }
-            [self.busyConversationIDs removeObject:conversationID];
+            NSLog(@"[DouyinDeepSeek] history hydration failed for %@: %@", conversationID, hydrateError.localizedDescription);
+            [self scheduleRetryForConversationID:conversationID messageID:processingMessageID delay:3 increaseCount:YES];
             return;
         }
         if (![self.pendingMessageIDs[conversationID] isEqualToString:processingMessageID]) {
-            // 生成期间来了更新消息，或用户已经手动回复；丢弃这条过期生成结果。
             [self.busyConversationIDs removeObject:conversationID];
-            DSConversationSnapshot *newer = [[DSRuntimeBridge shared] conversationForID:conversationID];
-            if (newer) [self processPendingConversation:newer];
             return;
         }
-        DSConversationSnapshot *fresh = [[DSRuntimeBridge shared] conversationForID:conversationID] ?: conversation;
-        [[DSRuntimeBridge shared] sendText:reply toConversation:fresh completion:^(BOOL success, NSError *sendError) {
-            if (success) {
-                self.lastReplyDates[conversationID] = NSDate.date;
-                NSLog(@"[DouyinDeepSeek] context reply handed to Douyin for %@", conversationID);
-            } else {
-                NSLog(@"[DouyinDeepSeek] send failed for %@: %@", conversationID, sendError.localizedDescription);
-            }
-            if ([self.pendingMessageIDs[conversationID] isEqualToString:processingMessageID]) {
-                [self.pendingMessageIDs removeObjectForKey:conversationID];
-            }
+        DSMessageSnapshot *trigger = nil;
+        for (DSMessageSnapshot *message in fresh.messages.reverseObjectEnumerator) {
+            if ([message.messageID isEqualToString:processingMessageID]) { trigger = message; break; }
+        }
+        if (trigger.direction != DSMessageDirectionIncoming) {
             [self.busyConversationIDs removeObject:conversationID];
-            DSConversationSnapshot *newer = [[DSRuntimeBridge shared] conversationForID:conversationID];
-            if (newer) [self processPendingConversation:newer];
+            [self clearPendingConversationID:conversationID messageID:processingMessageID];
+            return;
+        }
+
+        NSString *retryKey = [self retryKeyForConversationID:conversationID messageID:processingMessageID];
+        void (^sendReply)(NSString *) = ^(NSString *reply) {
+            if (![self.pendingMessageIDs[conversationID] isEqualToString:processingMessageID] || ![DSConfig shared].enabled) {
+                [self.busyConversationIDs removeObject:conversationID];
+                return;
+            }
+            NSString *operationID = [NSString stringWithFormat:@"auto:%@:%@", conversationID, processingMessageID];
+            [[DSRuntimeBridge shared] sendText:reply toConversation:fresh operationID:operationID completion:^(BOOL success, NSError *sendError) {
+                [self.busyConversationIDs removeObject:conversationID];
+                if (success || sendError.code == -7) {
+                    self.lastReplyDates[conversationID] = NSDate.date;
+                    [self markProcessedMessageID:processingMessageID];
+                    [self clearPendingConversationID:conversationID messageID:processingMessageID];
+                    NSLog(@"[DouyinDeepSeek] background reply transaction finished for %@", conversationID);
+                    return;
+                }
+                NSLog(@"[DouyinDeepSeek] send failed for %@: %@", conversationID, sendError.localizedDescription);
+                [self scheduleRetryForConversationID:conversationID messageID:processingMessageID delay:5 increaseCount:YES];
+            }];
+        };
+
+        NSString *cachedReply = self.generatedReplies[retryKey];
+        if (cachedReply.length) {
+            sendReply(cachedReply);
+            return;
+        }
+        NSArray *context = [[DSRuntimeBridge shared] apiMessagesForConversation:fresh];
+        [[DSDeepSeekClient shared] generateReplyWithMessages:context conversationID:conversationID completion:^(NSString *reply, NSError *error) {
+            if (error || !reply.length) {
+                [self.busyConversationIDs removeObject:conversationID];
+                NSLog(@"[DouyinDeepSeek] generation failed for %@: %@", conversationID, error.localizedDescription);
+                NSInteger code = error.code;
+                BOOL retryable = code == 408 || code == 429 || code < 0 || code >= 500;
+                if (retryable) [self scheduleRetryForConversationID:conversationID messageID:processingMessageID delay:3 increaseCount:YES];
+                else [self clearPendingConversationID:conversationID messageID:processingMessageID];
+                return;
+            }
+            self.generatedReplies[retryKey] = reply;
+            sendReply(reply);
         }];
     }];
 }
@@ -269,7 +364,7 @@ static id DSNewSectionDataArray(id self, SEL _cmd) {
     id item = [[itemClass alloc] init];
     DSSetObjectSettingValue(item, @"setIdentifier:", @"DouyinDeepSeek");
     DSSetObjectSettingValue(item, @"setTitle:", @"DeepSeek AI");
-    DSSetObjectSettingValue(item, @"setDetail:", @"0.2.1");
+    DSSetObjectSettingValue(item, @"setDetail:", @"0.3.0");
     DSSetIntegerSettingValue(item, @"setType:", 0);
     DSSetObjectSettingValue(item, @"setSvgIconImageName:", @"ic_module_outlined_20");
     DSSetIntegerSettingValue(item, @"setCellType:", 26);

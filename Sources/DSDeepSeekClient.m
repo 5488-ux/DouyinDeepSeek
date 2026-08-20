@@ -70,11 +70,11 @@ static NSString *DSTextFromContentValue(id value) {
                    conversationID:(NSString *)conversationID
                         completion:(DSDeepSeekCompletion)completion {
     DSConfig *config = [DSConfig shared];
-    NSMutableArray *payload = [NSMutableArray arrayWithObject:@{
-        @"role": @"system",
-        @"content": config.systemPrompt,
-    }];
-    [payload addObjectsFromArray:messages];
+    NSMutableArray *payload = [messages mutableCopy] ?: [NSMutableArray array];
+    BOOL alreadyHasSystem = [payload.firstObject[@"role"] isEqualToString:@"system"];
+    if (!alreadyHasSystem) {
+        [payload insertObject:@{ @"role": @"system", @"content": config.systemPrompt } atIndex:0];
+    }
     [self performRequestWithMessages:payload conversationID:conversationID completion:completion];
 }
 
@@ -160,6 +160,7 @@ static NSString *DSTextFromContentValue(id value) {
     NSURLSession *session = [NSURLSession sessionWithConfiguration:sessionConfig];
 
     [[session dataTaskWithRequest:request completionHandler:^(NSData *data, NSURLResponse *response, NSError *networkError) {
+        [session finishTasksAndInvalidate];
         if (networkError) {
             [self finishWithReply:nil error:networkError completion:completion];
             return;

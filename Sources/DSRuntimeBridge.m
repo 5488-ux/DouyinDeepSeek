@@ -93,6 +93,18 @@ static BOOL DSBoolValue(id object, NSArray<NSString *> *names, BOOL *found) {
     return NO;
 }
 
+static BOOL DSIntegerValue(id object, NSString *name, int64_t *value) {
+    if (!object || !name.length) return NO;
+    SEL selector = NSSelectorFromString(name);
+    if (![object respondsToSelector:selector]) return NO;
+    NSMethodSignature *signature = [object methodSignatureForSelector:selector];
+    if (!signature || signature.numberOfArguments != 2 ||
+        strchr("cCsSiIlLqQB", signature.methodReturnType[0]) == NULL) return NO;
+    int64_t (*send)(id, SEL) = (int64_t (*)(id, SEL))objc_msgSend;
+    if (value) *value = send(object, selector);
+    return YES;
+}
+
 static NSArray *DSArrayValue(id object, NSArray<NSString *> *paths) {
     id value = DSSafeValue(object, paths);
     if ([value isKindOfClass:NSArray.class]) return value;
@@ -126,6 +138,9 @@ static id DSUnwrappedConversation(id conversation) {
 @property (nonatomic, strong) NSMutableDictionary<NSString *, NSString *> *recentOutgoingTexts;
 @property (nonatomic, strong) NSMutableDictionary<NSString *, NSDate *> *recentOutgoingDates;
 @property (nonatomic, strong) NSMutableArray<NSString *> *diagnosticEvents;
+@property (nonatomic, strong) NSMutableDictionary<NSString *, NSString *> *captureSignatures;
+@property (nonatomic, strong) NSMutableSet<NSString *> *activeSendConversationIDs;
+@property (nonatomic, strong) NSMutableDictionary<NSString *, NSDate *> *completedSendOperations;
 @property (nonatomic, strong) dispatch_queue_t stateQueue;
 @end
 
@@ -147,6 +162,9 @@ static id DSUnwrappedConversation(id conversation) {
         _recentOutgoingTexts = [NSMutableDictionary dictionary];
         _recentOutgoingDates = [NSMutableDictionary dictionary];
         _diagnosticEvents = [NSMutableArray array];
+        _captureSignatures = [NSMutableDictionary dictionary];
+        _activeSendConversationIDs = [NSMutableSet set];
+        _completedSendOperations = [NSMutableDictionary dictionary];
         _stateQueue = dispatch_queue_create("com.codex.douyin.deepseek.bridge", DISPATCH_QUEUE_SERIAL);
         [self recordDiagnostic:@"插件运行桥初始化完成"];
     }
@@ -170,10 +188,14 @@ static id DSUnwrappedConversation(id conversation) {
 
 - (void)trackMessageController:(id)controller {
     if (!controller) return;
+    BOOL isNew = NO;
     @synchronized (self.messageControllers) {
+        isNew = ![self.messageControllers containsObject:controller];
         [self.messageControllers addObject:controller];
     }
-    [self recordDiagnostic:[NSString stringWithFormat:@"发现消息控制器：%@", NSStringFromClass([controller class])]];
+    if (isNew) {
+        [self recordDiagnostic:[NSString stringWithFormat:@"发现消息控制器：%@", NSStringFromClass([controller class])]];
+    }
 }
 
 - (void)trackFriendModel:(id)friendModel {
@@ -209,8 +231,9 @@ static id DSUnwrappedConversation(id conversation) {
 
 - (NSString *)displayNameFromObject:(id)object {
     NSString *name = DSStringValue(DSSafeValue(object, @[
-        @"displayName", @"nickname", @"nickName", @"name", @"title",
-        @"user.nickname", @"imUser.nickname", @"conversation.conversationName"
+        @"peerUser.nickname", @"peerUserViewModel.nickname", @"senderProfile.nickname",
+        @"user.nickname", @"imUser.nickname", @"conversation.peerUser.nickname",
+        @"conversation.conversationName", @"displayName", @"nickname", @"nickName", @"name"
     ]));
     return [name stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
 }
@@ -243,15 +266,50 @@ static id DSUnwrappedConversation(id conversation) {
     return messageID.length ? messageID : fallback;
 }
 
-- (BOOL)messageIsOutgoing:(id)object {
+- (BOOL)currentUserID:(int64_t *)userID {
+    Class utilityClass = objc_getClass("IESIMConversationUtility");
+    int64_t resolved = 0;
+    if (DSIntegerValue(utilityClass, @"currentSDKLoginUserID", &resolved) && resolved != 0) {
+        if (userID) *userID = resolved;
+        return YES;
+    }
+
+    id utility = DSSharedInstanceForClass(utilityClass);
+    if (DSIntegerValue(utility, @"currentSDKLoginUserID", &resolved) && resolved != 0) {
+        if (userID) *userID = resolved;
+        return YES;
+    }
+
+    id sdkInstance = nil;
+    Class instancesClass = objc_getClass("TIMXSDKInstancesManager");
+    SEL instanceSelector = NSSelectorFromString(@"iesim_TIMXSDKInstance");
+    if ([instancesClass respondsToSelector:instanceSelector]) {
+        sdkInstance = ((id (*)(id, SEL))objc_msgSend)(instancesClass, instanceSelector);
+    }
+    id value = DSSafeValue(sdkInstance, @[
+        @"context.currentUserManager.currentAccountID", @"context.currentUserImp.userID",
+        @"context.currentUserImp.uid", @"context.userCredential.userID",
+        @"context.userCredential.uid", @"context.currentAccountID"
+    ]);
+    if ([value respondsToSelector:@selector(longLongValue)]) {
+        resolved = [value longLongValue];
+        if (resolved != 0) {
+            if (userID) *userID = resolved;
+            return YES;
+        }
+    }
+    return NO;
+}
+
+- (DSMessageDirection)messageDirectionFromObject:(id)object {
     BOOL found = NO;
     BOOL outgoing = DSBoolValue(object, @[@"sendFromMe", @"realSendFromMe", @"sendFromMeOpt", @"isSelf", @"isSendByMe", @"isMine", @"isSelfMessage", @"isFromMe"], &found);
-    if (found) return outgoing;
+    if (found) return outgoing ? DSMessageDirectionOutgoing : DSMessageDirectionIncoming;
 
     id wrappedMessage = DSSafeValue(object, @[@"iesMessage", @"message", @"timMessage"]);
     if (wrappedMessage && wrappedMessage != object) {
         outgoing = DSBoolValue(wrappedMessage, @[@"sendFromMe", @"realSendFromMe", @"sendFromMeOpt", @"isSelf", @"isSendByMe", @"isMine", @"isSelfMessage", @"isFromMe"], &found);
-        if (found) return outgoing;
+        if (found) return outgoing ? DSMessageDirectionOutgoing : DSMessageDirectionIncoming;
     }
 
     id numeric = DSSafeValue(object, @[
@@ -259,26 +317,28 @@ static id DSUnwrappedConversation(id conversation) {
         @"iesMessage.msg_isSelf", @"iesMessage.senderIsSelf", @"iesMessage.isSender",
         @"message.msg_isSelf", @"message.senderIsSelf"
     ]);
-    if ([numeric respondsToSelector:@selector(boolValue)]) return [numeric boolValue];
+    if ([numeric respondsToSelector:@selector(boolValue)]) {
+        return [numeric boolValue] ? DSMessageDirectionOutgoing : DSMessageDirectionIncoming;
+    }
+
+    int64_t sender = 0;
+    int64_t currentUser = 0;
+    BOOL senderKnown = DSIntegerValue(object, @"sender", &sender);
+    if (!senderKnown && wrappedMessage) senderKnown = DSIntegerValue(wrappedMessage, @"sender", &sender);
+    if (senderKnown && sender != 0 && [self currentUserID:&currentUser]) {
+        return sender == currentUser ? DSMessageDirectionOutgoing : DSMessageDirectionIncoming;
+    }
 
     NSString *senderID = DSStringValue(DSSafeValue(object, @[
         @"senderID", @"senderId", @"sender", @"fromUid", @"fromUserID", @"fromUserId", @"msg_sender",
         @"sender.uid", @"sender.userID", @"iesMessage.senderID", @"iesMessage.senderId",
         @"iesMessage.sender", @"iesMessage.fromUid", @"iesMessage.fromUserID", @"iesMessage.sender.uid"
     ]));
-    id sdkInstance = nil;
-    Class instancesClass = objc_getClass("TIMXSDKInstancesManager");
-    SEL instanceSelector = NSSelectorFromString(@"iesim_TIMXSDKInstance");
-    if ([instancesClass respondsToSelector:instanceSelector]) {
-        sdkInstance = ((id (*)(id, SEL))objc_msgSend)(instancesClass, instanceSelector);
+    int64_t currentScalar = 0;
+    if (senderID.length && [self currentUserID:&currentScalar]) {
+        return senderID.longLongValue == currentScalar ? DSMessageDirectionOutgoing : DSMessageDirectionIncoming;
     }
-    NSString *currentUserID = DSStringValue(DSSafeValue(sdkInstance, @[
-        @"context.currentUserManager.currentAccountID", @"context.currentUserImp.userID",
-        @"context.currentUserImp.uid", @"context.userCredential.userID",
-        @"context.userCredential.uid", @"context.currentAccountID"
-    ]));
-    if (senderID.length && currentUserID.length) return [senderID isEqualToString:currentUserID];
-    return NO;
+    return DSMessageDirectionUnknown;
 }
 
 - (NSTimeInterval)messageTimestamp:(id)object fallback:(NSTimeInterval)fallback {
@@ -288,6 +348,64 @@ static id DSUnwrappedConversation(id conversation) {
     NSTimeInterval timestamp = [value doubleValue];
     if (timestamp > 1000000000000.0) timestamp /= 1000.0;
     return timestamp > 0 ? timestamp : fallback;
+}
+
+- (NSArray<DSMessageSnapshot *> *)messageSnapshotsFromRawMessages:(NSArray *)rawMessages
+                                                    conversationID:(NSString *)conversationID {
+    NSMutableArray<DSMessageSnapshot *> *messages = [NSMutableArray array];
+    NSTimeInterval now = NSDate.date.timeIntervalSince1970;
+    [rawMessages enumerateObjectsUsingBlock:^(id raw, NSUInteger index, BOOL *stop) {
+        NSString *text = [self messageTextFromObject:raw];
+        if (!text.length) return;
+        DSMessageSnapshot *message = [[DSMessageSnapshot alloc] init];
+        message.text = text;
+        message.direction = [self messageDirectionFromObject:raw];
+        message.timestamp = [self messageTimestamp:raw fallback:now + index / 1000.0];
+        NSString *fallback = [NSString stringWithFormat:@"%@-%.3f-%lu-%ld",
+                              conversationID, message.timestamp,
+                              (unsigned long)text.hash, (long)message.direction];
+        message.messageID = [self messageIDFromObject:raw fallback:fallback];
+        [messages addObject:message];
+    }];
+    return messages;
+}
+
+- (NSArray<DSMessageSnapshot *> *)mergeMessages:(NSArray<DSMessageSnapshot *> *)incoming
+                                       existing:(NSArray<DSMessageSnapshot *> *)existing {
+    NSMutableDictionary<NSString *, DSMessageSnapshot *> *byID = [NSMutableDictionary dictionary];
+    for (DSMessageSnapshot *message in existing ?: @[]) {
+        if (message.messageID.length) byID[message.messageID] = message;
+    }
+    for (DSMessageSnapshot *message in incoming ?: @[]) {
+        if (!message.messageID.length) continue;
+        DSMessageSnapshot *old = byID[message.messageID];
+        if (!old) {
+            byID[message.messageID] = message;
+            continue;
+        }
+        if (!old.text.length && message.text.length) old.text = message.text;
+        if (old.direction == DSMessageDirectionUnknown && message.direction != DSMessageDirectionUnknown) {
+            old.direction = message.direction;
+        }
+        if (old.timestamp <= 0 && message.timestamp > 0) old.timestamp = message.timestamp;
+    }
+    NSMutableArray<DSMessageSnapshot *> *result = [byID.allValues mutableCopy];
+    [result sortUsingComparator:^NSComparisonResult(DSMessageSnapshot *a, DSMessageSnapshot *b) {
+        if (a.timestamp < b.timestamp) return NSOrderedAscending;
+        if (a.timestamp > b.timestamp) return NSOrderedDescending;
+        return [a.messageID compare:b.messageID];
+    }];
+    if (result.count > 100) {
+        [result removeObjectsInRange:NSMakeRange(0, result.count - 100)];
+    }
+    return result;
+}
+
+- (BOOL)isDirectConversationObject:(id)conversation conversationID:(NSString *)conversationID {
+    BOOL found = NO;
+    BOOL direct = DSBoolValue(DSUnwrappedConversation(conversation), @[@"is1to1Chat"], &found);
+    if (found) return direct;
+    return [conversationID hasPrefix:@"0:1:"];
 }
 
 - (DSConversationSnapshot *)captureMessageController:(id)controller {
@@ -320,44 +438,41 @@ static id DSUnwrappedConversation(id conversation) {
     }
     if (!displayName.length) displayName = conversationID;
 
-    NSMutableArray<DSMessageSnapshot *> *messages = [NSMutableArray array];
-    NSTimeInterval now = NSDate.date.timeIntervalSince1970;
-    [rawMessages enumerateObjectsUsingBlock:^(id raw, NSUInteger index, BOOL *stop) {
-        NSString *text = [self messageTextFromObject:raw];
-        if (!text.length) return;
-        DSMessageSnapshot *message = [[DSMessageSnapshot alloc] init];
-        message.text = text;
-        message.outgoing = [self messageIsOutgoing:raw];
-        message.timestamp = [self messageTimestamp:raw fallback:now + index / 1000.0];
-        NSString *fallback = [NSString stringWithFormat:@"%@-%lu-%lu", conversationID, (unsigned long)index, (unsigned long)text.hash];
-        message.messageID = [self messageIDFromObject:raw fallback:fallback];
-        [messages addObject:message];
-    }];
-
-    [messages sortUsingComparator:^NSComparisonResult(DSMessageSnapshot *a, DSMessageSnapshot *b) {
-        if (a.timestamp < b.timestamp) return NSOrderedAscending;
-        if (a.timestamp > b.timestamp) return NSOrderedDescending;
-        return NSOrderedSame;
-    }];
+    NSArray<DSMessageSnapshot *> *messages = [self messageSnapshotsFromRawMessages:rawMessages conversationID:conversationID];
 
     DSConversationSnapshot *snapshot;
     @synchronized (self.conversations) {
         snapshot = self.conversations[conversationID] ?: [[DSConversationSnapshot alloc] init];
         snapshot.conversationID = conversationID;
-        snapshot.displayName = displayName;
-        snapshot.messages = messages;
+        if (!snapshot.displayName.length || [snapshot.displayName isEqualToString:conversationID]) {
+            snapshot.displayName = displayName;
+        }
+        snapshot.messages = [self mergeMessages:messages existing:snapshot.messages];
         snapshot.controller = controller;
-        if (conversation) snapshot.conversationObject = DSUnwrappedConversation(conversation);
+        snapshot.historyHydrated = rawMessages.count > 0;
+        if (conversation) {
+            snapshot.conversationObject = DSUnwrappedConversation(conversation);
+            snapshot.directConversation = [self isDirectConversationObject:conversation conversationID:conversationID];
+        } else if ([conversationID hasPrefix:@"0:1:"]) {
+            snapshot.directConversation = YES;
+        }
         self.conversations[conversationID] = snapshot;
     }
-    [self recordDiagnostic:[NSString stringWithFormat:@"会话捕获：ID=%@ 控制器=%@ 会话对象=%@ 原始=%lu 文本=%lu",
+    NSString *captureSignature = [NSString stringWithFormat:@"%lu/%lu/%@",
+                                  (unsigned long)rawMessages.count,
+                                  (unsigned long)snapshot.messages.count,
+                                  snapshot.messages.lastObject.messageID ?: @"nil"];
+    if (![self.captureSignatures[conversationID] isEqualToString:captureSignature]) {
+        self.captureSignatures[conversationID] = captureSignature;
+        [self recordDiagnostic:[NSString stringWithFormat:@"会话捕获：ID=%@ 控制器=%@ 会话对象=%@ 原始=%lu 合并后=%lu",
                             conversationID,
                             NSStringFromClass([controller class]),
                             conversation ? [NSString stringWithFormat:@"%@ -> %@",
                                             NSStringFromClass([conversation class]),
                                             NSStringFromClass([DSUnwrappedConversation(conversation) class])] : @"nil",
                             (unsigned long)rawMessages.count,
-                            (unsigned long)messages.count]];
+                            (unsigned long)snapshot.messages.count]];
+    }
     return snapshot;
 }
 
@@ -396,25 +511,31 @@ static id DSUnwrappedConversation(id conversation) {
             DSConversationSnapshot *snapshot = self.conversations[conversationID] ?: [[DSConversationSnapshot alloc] init];
             NSMutableArray<DSMessageSnapshot *> *messages = [snapshot.messages mutableCopy] ?: [NSMutableArray array];
 
-            BOOL duplicate = NO;
+            DSMessageSnapshot *duplicate = nil;
             for (DSMessageSnapshot *existing in messages) {
                 if ([existing.messageID isEqualToString:messageID]) {
-                    duplicate = YES;
+                    duplicate = existing;
                     break;
                 }
             }
-            if (duplicate) return;
+            DSMessageDirection direction = [self messageDirectionFromObject:raw];
+            if (duplicate) {
+                if (duplicate.direction == DSMessageDirectionUnknown && direction != DSMessageDirectionUnknown) {
+                    duplicate.direction = direction;
+                }
+                return;
+            }
 
             DSMessageSnapshot *message = [[DSMessageSnapshot alloc] init];
             message.messageID = messageID;
             message.text = text;
-            message.outgoing = [self messageIsOutgoing:raw];
+            message.direction = direction;
             message.timestamp = [self messageTimestamp:raw fallback:now + index / 1000.0];
             NSString *recentText = self.recentOutgoingTexts[conversationID];
             NSDate *recentDate = self.recentOutgoingDates[conversationID];
-            if (!message.outgoing && recentText.length && [recentText isEqualToString:text] &&
+            if (message.direction == DSMessageDirectionUnknown && recentText.length && [recentText isEqualToString:text] &&
                 recentDate && -recentDate.timeIntervalSinceNow < 120) {
-                message.outgoing = YES;
+                message.direction = DSMessageDirectionOutgoing;
                 [self.recentOutgoingTexts removeObjectForKey:conversationID];
                 [self.recentOutgoingDates removeObjectForKey:conversationID];
             }
@@ -431,7 +552,12 @@ static id DSUnwrappedConversation(id conversation) {
             id conversation = [self conversationForID:conversationID inMap:conversationMap];
             snapshot.conversationID = conversationID;
             snapshot.messages = messages;
-            if (conversation) snapshot.conversationObject = DSUnwrappedConversation(conversation);
+            if (conversation) {
+                snapshot.conversationObject = DSUnwrappedConversation(conversation);
+                snapshot.directConversation = [self isDirectConversationObject:conversation conversationID:conversationID];
+            } else if ([conversationID hasPrefix:@"0:1:"]) {
+                snapshot.directConversation = YES;
+            }
             NSString *displayName = [self displayNameFromObject:conversation];
             if (!displayName.length) displayName = [self displayNameFromObject:raw];
             if (displayName.length) snapshot.displayName = displayName;
@@ -451,6 +577,110 @@ static id DSUnwrappedConversation(id conversation) {
                                 conversationMap ? NSStringFromClass([conversationMap class]) : @"nil"]];
         return changed;
     }
+}
+
+- (NSArray *)historyMessagesFromConversationID:(NSString *)conversationID limit:(NSInteger)limit {
+    if (!conversationID.length) return @[];
+    NSInteger safeLimit = MAX(20, MIN(100, limit));
+    NSArray *(^normalize)(id) = ^NSArray *(id value) {
+        if ([value isKindOfClass:NSArray.class]) return value;
+        return DSArrayValue(value, @[@"messages", @"currentMessagesAll", @"currentMessagesFiltered", @"items", @"list"]);
+    };
+
+    Class messageManagerClass = objc_getClass("TIMXOMessageManager");
+    Class instancesClass = objc_getClass("TIMXSDKInstancesManager");
+    SEL sdkSelector = NSSelectorFromString(@"iesim_TIMXSDKInstance");
+    id sdk = [instancesClass respondsToSelector:sdkSelector]
+        ? ((id (*)(id, SEL))objc_msgSend)(instancesClass, sdkSelector) : nil;
+    id manager = nil;
+    SEL initSelector = NSSelectorFromString(@"initWithRootObject:");
+    if (messageManagerClass && sdk && [messageManagerClass instancesRespondToSelector:initSelector]) {
+        manager = ((id (*)(id, SEL, id))objc_msgSend)([messageManagerClass alloc], initSelector, sdk);
+    }
+    SEL messagesSelector = NSSelectorFromString(@"messagesInConversation:excludeMessageTypes:limit:");
+    if (manager && [manager respondsToSelector:messagesSelector]) {
+        @try {
+            id value = ((id (*)(id, SEL, id, id, NSInteger))objc_msgSend)(manager, messagesSelector, conversationID, @[], safeLimit);
+            NSArray *messages = normalize(value);
+            if (messages.count) return messages;
+        } @catch (NSException *exception) {
+            [self recordDiagnostic:[NSString stringWithFormat:@"消息库主路线异常：%@", exception.reason ?: exception.name]];
+        }
+    }
+
+    id sharedMessageManager = DSSharedInstanceForClass(messageManagerClass);
+    for (NSString *selectorName in @[@"getMessagesForConversation:limit:", @"getMessagesInConversation:limit:"]) {
+        SEL selector = NSSelectorFromString(selectorName);
+        if (![sharedMessageManager respondsToSelector:selector]) continue;
+        @try {
+            id value = ((id (*)(id, SEL, id, NSInteger))objc_msgSend)(sharedMessageManager, selector, conversationID, safeLimit);
+            NSArray *messages = normalize(value);
+            if (messages.count) return messages;
+        } @catch (__unused NSException *exception) {}
+    }
+    SEL oneArgumentSelector = NSSelectorFromString(@"messagesForConversation:");
+    if ([sharedMessageManager respondsToSelector:oneArgumentSelector]) {
+        @try {
+            id value = ((id (*)(id, SEL, id))objc_msgSend)(sharedMessageManager, oneArgumentSelector, conversationID);
+            NSArray *messages = normalize(value);
+            if (messages.count) return messages;
+        } @catch (__unused NSException *exception) {}
+    }
+
+    Class dataManagerClass = objc_getClass("IESIMConversationDataManager");
+    id dataManager = DSSharedInstanceForClass(dataManagerClass);
+    SEL dataSelector = NSSelectorFromString(@"getMessagesInConversation:limit:");
+    if ([dataManager respondsToSelector:dataSelector]) {
+        @try {
+            id value = ((id (*)(id, SEL, id, NSInteger))objc_msgSend)(dataManager, dataSelector, conversationID, safeLimit);
+            NSArray *messages = normalize(value);
+            if (messages.count) return messages;
+        } @catch (__unused NSException *exception) {}
+    }
+
+    Class sourceClass = objc_getClass("ECOMTIMOMessagesInConversationDataSource");
+    SEL sourceInit = NSSelectorFromString(@"initWithInitialLocationLatestMessageForConversationID:options:");
+    id source = nil;
+    if (sourceClass && [sourceClass instancesRespondToSelector:sourceInit]) {
+        @try {
+            source = ((id (*)(id, SEL, id, id))objc_msgSend)([sourceClass alloc], sourceInit, conversationID, @{ @"limit": @(safeLimit) });
+        } @catch (__unused NSException *exception) {}
+    }
+    NSArray *sourceMessages = normalize(source);
+    return sourceMessages ?: @[];
+}
+
+- (void)hydrateConversation:(DSConversationSnapshot *)conversation completion:(DSHydrationCompletion)completion {
+    if (!conversation.conversationID.length) {
+        NSError *error = [NSError errorWithDomain:DSBridgeErrorDomain code:-20 userInfo:@{NSLocalizedDescriptionKey: @"会话 ID 为空，无法加载历史。"}];
+        completion(nil, error);
+        return;
+    }
+    NSString *conversationID = conversation.conversationID;
+    [self fetchConversation:conversationID completion:^(id fetchedConversation) {
+        id sdkConversation = DSUnwrappedConversation(fetchedConversation ?: conversation.conversationObject);
+        NSArray *rawHistory = [self historyMessagesFromConversationID:conversationID limit:[DSConfig shared].contextLimit];
+        NSArray<DSMessageSnapshot *> *history = [self messageSnapshotsFromRawMessages:rawHistory conversationID:conversationID];
+        DSConversationSnapshot *snapshot = nil;
+        @synchronized (self.conversations) {
+            snapshot = self.conversations[conversationID] ?: conversation;
+            snapshot.conversationID = conversationID;
+            snapshot.messages = [self mergeMessages:history existing:snapshot.messages];
+            if (sdkConversation) snapshot.conversationObject = sdkConversation;
+            snapshot.directConversation = [self isDirectConversationObject:sdkConversation conversationID:conversationID];
+            snapshot.historyHydrated = rawHistory.count > 0 || snapshot.historyHydrated;
+            self.conversations[conversationID] = snapshot;
+        }
+        if (!snapshot.historyHydrated) {
+            NSString *message = @"未能从抖音本地消息库加载该会话历史，已停止生成，避免只看一条消息瞎回。";
+            [self recordDiagnostic:[NSString stringWithFormat:@"后台历史加载失败：cid=%@", conversationID]];
+            completion(snapshot, [NSError errorWithDomain:DSBridgeErrorDomain code:-21 userInfo:@{NSLocalizedDescriptionKey: message}]);
+            return;
+        }
+        [self recordDiagnostic:[NSString stringWithFormat:@"后台历史加载成功：cid=%@ 原始=%lu 合并后=%lu",
+                                conversationID, (unsigned long)rawHistory.count, (unsigned long)snapshot.messages.count]];
+        completion(snapshot, nil);
+    }];
 }
 
 - (NSArray<DSConversationSnapshot *> *)knownConversations {
@@ -474,22 +704,28 @@ static id DSUnwrappedConversation(id conversation) {
 - (NSArray<NSDictionary<NSString *,NSString *> *> *)apiMessagesForConversation:(DSConversationSnapshot *)conversation {
     DSConfig *config = [DSConfig shared];
     NSInteger limit = config.contextLimit;
-    NSArray<DSMessageSnapshot *> *all = conversation.messages ?: @[];
+    NSMutableArray<DSMessageSnapshot *> *known = [NSMutableArray array];
+    for (DSMessageSnapshot *message in conversation.messages ?: @[]) {
+        if (message.text.length && message.direction != DSMessageDirectionUnknown) [known addObject:message];
+    }
+    NSArray<DSMessageSnapshot *> *all = known;
     NSUInteger start = all.count > limit ? all.count - limit : 0;
     NSMutableArray *result = [NSMutableArray array];
     NSString *ownerName = config.ownerName.length ? config.ownerName : @"我";
     NSString *contactName = conversation.displayName.length ? conversation.displayName : @"对方";
     NSString *identityInstruction = [NSString stringWithFormat:
-        @"这是账号主人“%@”与联系人“%@”的一对一私信。历史记录中，role=assistant 和【%@说】都表示账号主人本人此前发送的内容，不代表模型自己说过；role=user 和【%@说】都表示联系人发来的内容。你现在必须站在“%@”的身份，结合双方完整上下文，生成下一条发给“%@”的回复。要明确区分双方，不能把联系人说的话当成账号主人说的，也不能遗漏账号主人此前说过的话。只输出回复正文。",
-        ownerName, contactName, ownerName, contactName, ownerName, contactName];
+        @"这是账号主人“%@”与联系人“%@”的一对一私信。历史记录中，role=assistant 和【%@说】都表示账号主人本人此前发送的内容，不代表模型自己说过；role=user 和【%@说】都表示联系人发来的内容。你现在必须站在“%@”的身份，结合双方完整上下文，生成下一条发给“%@”的回复。要明确区分双方，不能把联系人说的话当成账号主人说的，也不能遗漏账号主人此前说过的话。账号主人的口吻要求：%@。只输出回复正文。",
+        ownerName, contactName, ownerName, contactName, ownerName, contactName, config.systemPrompt];
     [result addObject:@{ @"role": @"system", @"content": identityInstruction }];
     for (NSUInteger i = start; i < all.count; i++) {
         DSMessageSnapshot *message = all[i];
         if (!message.text.length) continue;
-        NSString *speaker = message.outgoing ? ownerName : contactName;
+        if (message.direction == DSMessageDirectionUnknown) continue;
+        BOOL outgoing = message.direction == DSMessageDirectionOutgoing;
+        NSString *speaker = outgoing ? ownerName : contactName;
         NSString *labeledText = [NSString stringWithFormat:@"【%@说】%@", speaker, message.text];
         [result addObject:@{
-            @"role": message.outgoing ? @"assistant" : @"user",
+            @"role": outgoing ? @"assistant" : @"user",
             @"content": labeledText,
         }];
     }
@@ -563,6 +799,7 @@ static id DSUnwrappedConversation(id conversation) {
 - (void)waitForSentText:(NSString *)text
           conversationID:(NSString *)conversationID
        baselineMessageIDs:(NSSet<NSString *> *)baselineMessageIDs
+                notBefore:(NSTimeInterval)notBefore
          remainingChecks:(NSInteger)remainingChecks
               completion:(void (^)(BOOL confirmed))completion {
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(800 * NSEC_PER_MSEC)), dispatch_get_main_queue(), ^{
@@ -571,7 +808,8 @@ static id DSUnwrappedConversation(id conversation) {
             DSConversationSnapshot *snapshot = self.conversations[conversationID];
             for (DSMessageSnapshot *message in snapshot.messages.reverseObjectEnumerator) {
                 BOOL isNew = !message.messageID.length || ![baselineMessageIDs containsObject:message.messageID];
-                if (isNew && [message.text isEqualToString:text]) {
+                BOOL outgoing = message.direction == DSMessageDirectionOutgoing;
+                if (isNew && outgoing && message.timestamp + 1.0 >= notBefore && [message.text isEqualToString:text]) {
                     matched = message;
                     break;
                 }
@@ -579,7 +817,8 @@ static id DSUnwrappedConversation(id conversation) {
         }
         if (matched) {
             [self recordDiagnostic:[NSString stringWithFormat:@"真实发信确认：messageID=%@ outgoing=%@",
-                                    matched.messageID ?: @"nil", matched.outgoing ? @"✓" : @"✗"]];
+                                    matched.messageID ?: @"nil",
+                                    matched.direction == DSMessageDirectionOutgoing ? @"✓" : @"✗"]];
             completion(YES);
             return;
         }
@@ -587,11 +826,12 @@ static id DSUnwrappedConversation(id conversation) {
             [self waitForSentText:text
                   conversationID:conversationID
                baselineMessageIDs:baselineMessageIDs
+                       notBefore:notBefore
                  remainingChecks:remainingChecks - 1
                       completion:completion];
             return;
         }
-        [self recordDiagnostic:@"真实发信确认失败：6.4 秒内会话中没有出现生成文本"];
+        [self recordDiagnostic:@"真实发信确认失败：未观测到同事务的我方新消息"];
         completion(NO);
     });
 }
@@ -612,6 +852,7 @@ static id DSUnwrappedConversation(id conversation) {
         [self waitForSentText:text
                conversationID:conversationID
             baselineMessageIDs:baselineMessageIDs
+                    notBefore:NSDate.date.timeIntervalSince1970 - 15
               remainingChecks:8
                    completion:^(BOOL confirmed) {
             if (confirmed) {
@@ -629,6 +870,16 @@ static id DSUnwrappedConversation(id conversation) {
 }
 
 - (void)sendText:(NSString *)text toConversation:(DSConversationSnapshot *)conversation completion:(DSSendCompletion)completion {
+    [self sendText:text
+     toConversation:conversation
+         operationID:[@"manual:" stringByAppendingString:NSUUID.UUID.UUIDString]
+          completion:completion];
+}
+
+- (void)sendText:(NSString *)text
+  toConversation:(DSConversationSnapshot *)conversation
+      operationID:(NSString *)operationID
+       completion:(DSSendCompletion)completion {
     if (!text.length || !conversation.conversationID.length) {
         [self recordDiagnostic:[NSString stringWithFormat:@"发送入口拒绝：text=%lu cid=%@",
                                 (unsigned long)text.length, conversation.conversationID ?: @"nil"]];
@@ -637,7 +888,38 @@ static id DSUnwrappedConversation(id conversation) {
     }
 
     NSString *conversationID = conversation.conversationID;
+    NSString *safeOperationID = operationID.length ? operationID : [@"manual:" stringByAppendingString:NSUUID.UUID.UUIDString];
+    @synchronized (self.activeSendConversationIDs) {
+        NSDate *completedDate = self.completedSendOperations[safeOperationID];
+        if (completedDate && -completedDate.timeIntervalSinceNow < 600) {
+            [self recordDiagnostic:[NSString stringWithFormat:@"发送幂等命中：%@", safeOperationID]];
+            completion(YES, nil);
+            return;
+        }
+        if ([self.activeSendConversationIDs containsObject:conversationID]) {
+            NSString *message = @"这个会话已有一条消息正在发送，已阻止并发重复发送。";
+            completion(NO, [NSError errorWithDomain:DSBridgeErrorDomain code:-8 userInfo:@{NSLocalizedDescriptionKey: message}]);
+            return;
+        }
+        [self.activeSendConversationIDs addObject:conversationID];
+    }
+    __block BOOL didFinish = NO;
+    void (^finish)(BOOL, NSError *) = ^(BOOL success, NSError *error) {
+        if (didFinish) return;
+        didFinish = YES;
+        @synchronized (self.activeSendConversationIDs) {
+            [self.activeSendConversationIDs removeObject:conversationID];
+            if (success || error.code == -7) self.completedSendOperations[safeOperationID] = NSDate.date;
+            NSMutableArray<NSString *> *expired = [NSMutableArray array];
+            [self.completedSendOperations enumerateKeysAndObjectsUsingBlock:^(NSString *key, NSDate *date, BOOL *stop) {
+                if (-date.timeIntervalSinceNow >= 600) [expired addObject:key];
+            }];
+            [self.completedSendOperations removeObjectsForKeys:expired];
+        }
+        completion(success, error);
+    };
     NSSet<NSString *> *baselineMessageIDs = [self messageIDsForConversationID:conversationID];
+    NSTimeInterval sendStartedAt = NSDate.date.timeIntervalSince1970;
     [self recordDiagnostic:[NSString stringWithFormat:@"开始真实发送：cid=%@ 文本=%lu controller=%@ storedConversation=%@ baseline=%lu",
                             conversationID,
                             (unsigned long)text.length,
@@ -659,9 +941,9 @@ static id DSUnwrappedConversation(id conversation) {
             [self recordDiagnostic:[NSString stringWithFormat:@"原生发信未调用成功：%@，转 Yuki", diagnostic]];
             [self attemptYukiSendText:text
                         conversationID:conversationID
-                     baselineMessageIDs:baselineMessageIDs
+                             baselineMessageIDs:baselineMessageIDs
                              diagnostic:diagnostic
-                             completion:completion];
+                             completion:finish];
             return;
         }
 
@@ -671,18 +953,16 @@ static id DSUnwrappedConversation(id conversation) {
         [self waitForSentText:text
                conversationID:conversationID
             baselineMessageIDs:baselineMessageIDs
+                    notBefore:sendStartedAt
               remainingChecks:8
                    completion:^(BOOL confirmed) {
             if (confirmed) {
-                completion(YES, nil);
+                finish(YES, nil);
                 return;
             }
-            [self recordDiagnostic:@"原生发信无真实确认，转 Yuki 再试一次"];
-            [self attemptYukiSendText:text
-                        conversationID:conversationID
-                     baselineMessageIDs:baselineMessageIDs
-                             diagnostic:diagnostic
-                             completion:completion];
+            [self recordDiagnostic:@"原生发信已执行但暂未观测到回执；为防重复，不再调用 Yuki"];
+            NSString *message = @"抖音原生发信方法已执行，但暂未收到消息回执。为防止一条话发送两次，本次不会切换第二条发信链。请稍后查看会话。";
+            finish(NO, [NSError errorWithDomain:DSBridgeErrorDomain code:-7 userInfo:@{NSLocalizedDescriptionKey: message}]);
         }];
     }];
 }
@@ -739,7 +1019,7 @@ static id DSUnwrappedConversation(id conversation) {
             [self recordDiagnostic:[NSString stringWithFormat:@"调用发信选择器：%@ %@", NSStringFromClass([sender class]), NSStringFromSelector(selector)]];
             id result = ((id (*)(id, SEL, id, id, BOOL, id))objc_msgSend)(sender, selector, message, conversation, NO, nil);
             [self recordDiagnostic:[NSString stringWithFormat:@"发信选择器返回：%@", result ? NSStringFromClass([result class]) : @"nil"]];
-            return result != nil;
+            return YES;
         }
 
         selector = NSSelectorFromString(@"sendMessage:conversation:forwardMessage:mentionUsers:enterFrom:");
@@ -747,7 +1027,7 @@ static id DSUnwrappedConversation(id conversation) {
             [self recordDiagnostic:[NSString stringWithFormat:@"调用发信选择器：%@ %@", NSStringFromClass([sender class]), NSStringFromSelector(selector)]];
             id result = ((id (*)(id, SEL, id, id, BOOL, id, id))objc_msgSend)(sender, selector, message, conversation, NO, nil, @"DouyinDeepSeek");
             [self recordDiagnostic:[NSString stringWithFormat:@"发信选择器返回：%@", result ? NSStringFromClass([result class]) : @"nil"]];
-            return result != nil;
+            return YES;
         }
 
         selector = NSSelectorFromString(@"sendMessage:conversation:");
@@ -755,7 +1035,7 @@ static id DSUnwrappedConversation(id conversation) {
             [self recordDiagnostic:[NSString stringWithFormat:@"调用发信选择器：%@ %@", NSStringFromClass([sender class]), NSStringFromSelector(selector)]];
             id result = ((id (*)(id, SEL, id, id))objc_msgSend)(sender, selector, message, conversation);
             [self recordDiagnostic:[NSString stringWithFormat:@"发信选择器返回：%@", result ? NSStringFromClass([result class]) : @"nil"]];
-            return result != nil;
+            return YES;
         }
 
         selector = NSSelectorFromString(@"sendMessage:");
@@ -763,7 +1043,7 @@ static id DSUnwrappedConversation(id conversation) {
             [self recordDiagnostic:[NSString stringWithFormat:@"调用发信选择器：%@ %@", NSStringFromClass([sender class]), NSStringFromSelector(selector)]];
             id result = ((id (*)(id, SEL, id))objc_msgSend)(sender, selector, message);
             [self recordDiagnostic:[NSString stringWithFormat:@"发信选择器返回：%@", result ? NSStringFromClass([result class]) : @"nil"]];
-            return result != nil;
+            return YES;
         }
     } @catch (NSException *exception) {
         [self recordDiagnostic:[NSString stringWithFormat:@"发信选择器异常：%@ / %@", exception.name, exception.reason ?: @"无原因"]];
@@ -872,16 +1152,18 @@ static id DSUnwrappedConversation(id conversation) {
     @synchronized (self.conversations) { conversationCount = self.conversations.count; }
     NSUInteger ownerMessageCount = 0;
     NSUInteger contactMessageCount = 0;
+    NSUInteger unknownMessageCount = 0;
     for (DSMessageSnapshot *message in conversation.messages) {
-        if (message.outgoing) ownerMessageCount++;
-        else contactMessageCount++;
+        if (message.direction == DSMessageDirectionOutgoing) ownerMessageCount++;
+        else if (message.direction == DSMessageDirectionIncoming) contactMessageCount++;
+        else unknownMessageCount++;
     }
     NSArray<NSString *> *events;
     @synchronized (self.diagnosticEvents) { events = [self.diagnosticEvents copy]; }
 
     NSMutableString *report = [NSMutableString string];
     [report appendString:@"DouyinDeepSeek 运行报错\n"];
-    [report appendString:@"插件版本：0.2.1\n"];
+    [report appendString:@"插件版本：0.3.0\n"];
     [report appendFormat:@"抖音版本：%@ (%@)\n", appVersion, appBuild];
     [report appendFormat:@"系统：iOS %@ / %@\n", UIDevice.currentDevice.systemVersion, UIDevice.currentDevice.model];
     [report appendFormat:@"兼容性：%@\n", [self compatibilitySummary]];
@@ -890,8 +1172,12 @@ static id DSUnwrappedConversation(id conversation) {
     [report appendFormat:@"上下文文本：%lu\n", (unsigned long)conversation.messages.count];
     [report appendFormat:@"身份映射：账号主人=%@ / 联系人=%@\n",
      [DSConfig shared].ownerName ?: @"我", conversation.displayName ?: @"对方"];
-    [report appendFormat:@"身份统计：账号主人消息=%lu / 联系人消息=%lu\n",
-     (unsigned long)ownerMessageCount, (unsigned long)contactMessageCount];
+    [report appendFormat:@"身份统计：账号主人消息=%lu / 联系人消息=%lu / 方向未知=%lu\n",
+     (unsigned long)ownerMessageCount, (unsigned long)contactMessageCount, (unsigned long)unknownMessageCount];
+    [report appendFormat:@"后台能力：一对一=%@ / 历史已加载=%@ / 无需打开聊天框=%@\n",
+     conversation.directConversation ? @"✓" : @"✗",
+     conversation.historyHydrated ? @"✓" : @"✗",
+     (conversation.directConversation && conversation.historyHydrated) ? @"✓" : @"✗"];
     [report appendFormat:@"控制器：%@ / sendMessage:%@\n",
      controller ? NSStringFromClass([controller class]) : @"nil",
      [controller respondsToSelector:NSSelectorFromString(@"sendMessage:")] ? @"✓" : @"✗"];
