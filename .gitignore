@@ -1,7 +1,5 @@
+__pycache__/
+*.pyc
 .theos/
 packages/
-obj/
-*.deb
-*.dylib
-.DS_Store
-
+artifact/
