@@ -38,6 +38,24 @@ static NSString *DSTextFromContentValue(id value) {
     return nil;
 }
 
+static NSString *DSStripGeneratedSpeakerLabels(NSString *text) {
+    NSString *current = [text stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+    for (NSInteger index = 0; index < 32 && current.length; index++) {
+        NSString *closing = nil;
+        if ([current hasPrefix:@"["]) closing = @"]";
+        else if ([current hasPrefix:@"【"]) closing = @"】";
+        else break;
+
+        NSRange closingRange = [current rangeOfString:closing];
+        if (closingRange.location == NSNotFound || closingRange.location < 2 || closingRange.location > 48) break;
+        NSString *inside = [current substringWithRange:NSMakeRange(1, closingRange.location - 1)];
+        inside = [inside stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+        if (![inside hasSuffix:@"说"]) break;
+        current = [[current substringFromIndex:NSMaxRange(closingRange)] stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+    }
+    return current ?: @"";
+}
+
 @interface DSDeepSeekClient ()
 
 - (void)performRequestWithMessages:(NSArray<NSDictionary<NSString *, NSString *> *> *)messages
@@ -203,6 +221,7 @@ static NSString *DSTextFromContentValue(id value) {
         NSString *reply = DSTextFromContentValue(message[@"content"]);
         if (!reply.length) reply = DSTextFromContentValue(choice[@"text"]);
         if (!reply.length) reply = DSTextFromContentValue(json[@"output_text"]);
+        reply = DSStripGeneratedSpeakerLabels(reply);
         if (reply.length) {
             [self finishWithReply:reply error:nil completion:completion];
             return;

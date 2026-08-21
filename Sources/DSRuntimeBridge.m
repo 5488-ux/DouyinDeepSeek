@@ -77,6 +77,24 @@ static NSString *DSTextValue(id value, NSInteger depth) {
     return nil;
 }
 
+static NSString *DSStripLeadingSpeakerLabels(NSString *text) {
+    NSString *current = [text stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+    for (NSInteger index = 0; index < 32 && current.length; index++) {
+        NSString *closing = nil;
+        if ([current hasPrefix:@"["]) closing = @"]";
+        else if ([current hasPrefix:@"【"]) closing = @"】";
+        else break;
+
+        NSRange closingRange = [current rangeOfString:closing];
+        if (closingRange.location == NSNotFound || closingRange.location < 2 || closingRange.location > 48) break;
+        NSString *inside = [current substringWithRange:NSMakeRange(1, closingRange.location - 1)];
+        inside = [inside stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+        if (![inside hasSuffix:@"说"]) break;
+        current = [[current substringFromIndex:NSMaxRange(closingRange)] stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+    }
+    return current ?: @"";
+}
+
 static BOOL DSBoolValue(id object, NSArray<NSString *> *names, BOOL *found) {
     for (NSString *name in names) {
         SEL selector = NSSelectorFromString(name);
@@ -847,12 +865,12 @@ static id DSUnwrappedConversation(id conversation) {
     NSString *identityInstruction = nil;
     if (conversation.groupConversation) {
         identityInstruction = [NSString stringWithFormat:
-            @"这是群聊“%@”。账号主人是“%@”，你必须始终站在“%@”的身份发言。历史记录中 role=assistant 和【%@说】表示账号主人本人发出的内容；role=user 表示其他群成员发言，每句前的【姓名说】或【群成员(ID)说】是该句真实发送者，绝不能把不同成员混成一个人。当前需要回复的主要对象是“%@”，但回复会发送到整个群聊；请结合全群上下文自然回应，必要时直接称呼对方，不能声称其他成员说过账号主人说的话。账号主人的口吻要求：%@。只输出要发到群里的回复正文。",
-            contactName, ownerName, ownerName, ownerName, triggerName, config.systemPrompt];
+            @"这是群聊“%@”。账号主人是“%@”，你必须始终站在“%@”的身份发言。历史记录中 role=assistant 的纯正文表示账号主人本人发出的内容；role=user 表示其他群成员发言，每句前的【姓名说】或【群成员(ID)说】是该句真实发送者，绝不能把不同成员混成一个人。当前需要回复的主要对象是“%@”，但回复会发送到整个群聊；请结合全群上下文自然回应，必要时直接称呼对方，不能声称其他成员说过账号主人说的话。账号主人的口吻要求：%@。只输出要发到群里的纯回复正文，严禁输出或复制任何“[某某说]”“【某某说】”身份标签。",
+            contactName, ownerName, ownerName, triggerName, config.systemPrompt];
     } else {
         identityInstruction = [NSString stringWithFormat:
-            @"这是账号主人“%@”与联系人“%@”的一对一私信。历史记录中，role=assistant 和【%@说】都表示账号主人本人此前发送的内容，不代表模型自己说过；role=user 和【%@说】都表示联系人发来的内容。你现在必须站在“%@”的身份，结合双方完整上下文，生成下一条发给“%@”的回复。要明确区分双方，不能把联系人说的话当成账号主人说的，也不能遗漏账号主人此前说过的话。账号主人的口吻要求：%@。只输出回复正文。",
-            ownerName, contactName, ownerName, contactName, ownerName, contactName, config.systemPrompt];
+            @"这是账号主人“%@”与联系人“%@”的一对一私信。历史记录中 role=assistant 的纯正文表示账号主人本人此前发送的内容，不代表模型自己说过；role=user 和【%@说】表示联系人发来的内容。你现在必须站在“%@”的身份，结合双方完整上下文，生成下一条发给“%@”的回复。要明确区分双方，不能把联系人说的话当成账号主人说的，也不能遗漏账号主人此前说过的话。账号主人的口吻要求：%@。只输出纯回复正文，严禁输出或复制任何“[某某说]”“【某某说】”身份标签。",
+            ownerName, contactName, contactName, ownerName, contactName, config.systemPrompt];
     }
     [result addObject:@{ @"role": @"system", @"content": identityInstruction }];
     for (NSUInteger i = start; i < all.count; i++) {
@@ -861,7 +879,9 @@ static id DSUnwrappedConversation(id conversation) {
         if (message.direction == DSMessageDirectionUnknown) continue;
         BOOL outgoing = message.direction == DSMessageDirectionOutgoing;
         NSString *speaker = speakerForMessage(message);
-        NSString *labeledText = [NSString stringWithFormat:@"【%@说】%@", speaker, message.text];
+        NSString *cleanText = DSStripLeadingSpeakerLabels(message.text);
+        if (!cleanText.length) continue;
+        NSString *labeledText = outgoing ? cleanText : [NSString stringWithFormat:@"【%@说】%@", speaker, cleanText];
         [result addObject:@{
             @"role": outgoing ? @"assistant" : @"user",
             @"content": labeledText,
@@ -1306,7 +1326,7 @@ static id DSUnwrappedConversation(id conversation) {
 
     NSMutableString *report = [NSMutableString string];
     [report appendString:@"DouyinDeepSeek 运行报错\n"];
-    [report appendString:@"插件版本：0.4.0\n"];
+    [report appendString:@"插件版本：0.4.1\n"];
     [report appendFormat:@"抖音版本：%@ (%@)\n", appVersion, appBuild];
     [report appendFormat:@"系统：iOS %@ / %@\n", UIDevice.currentDevice.systemVersion, UIDevice.currentDevice.model];
     [report appendFormat:@"兼容性：%@\n", [self compatibilitySummary]];

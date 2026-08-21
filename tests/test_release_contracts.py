@@ -31,6 +31,20 @@ class ReleaseContracts(unittest.TestCase):
         self.assertIn("DSMessageDirectionUnknown", body)
         self.assertIn('@"assistant" : @"user"', body)
         self.assertIn("【%@说】", body)
+        self.assertIn("outgoing ? cleanText", body)
+        self.assertIn("DSStripLeadingSpeakerLabels", body)
+
+    def test_generated_reply_strips_repeated_speaker_labels(self):
+        client = read("Sources/DSDeepSeekClient.m")
+        cleaner = method_body(client, "static NSString *DSStripGeneratedSpeakerLabels", "@interface DSDeepSeekClient")
+        self.assertIn('hasPrefix:@"["', cleaner)
+        self.assertIn('hasPrefix:@"【"', cleaner)
+        self.assertIn('hasSuffix:@"说"', cleaner)
+        self.assertIn("index < 32", cleaner)
+        self.assertIn("reply = DSStripGeneratedSpeakerLabels(reply);", client)
+        bridge = read("Sources/DSRuntimeBridge.m")
+        context = method_body(bridge, "- (NSArray<NSDictionary", "- (BOOL)sendTextThroughYuki")
+        self.assertIn("严禁输出或复制任何", context)
 
     def test_direction_is_three_state_and_unknown_never_queues(self):
         header = read("Sources/DSRuntimeBridge.h")
@@ -129,7 +143,7 @@ class ReleaseContracts(unittest.TestCase):
         tweak = re.search(r'setDetail:\", @\"([^\"]+)', read("Tweak.xm")).group(1)
         diagnostic = re.search(r"插件版本：([^\\]+)\\n", read("Sources/DSRuntimeBridge.m")).group(1)
         readme = re.search(r"^##\s+([^\s]+)", read("README.md"), re.M).group(1)
-        self.assertEqual({control, tweak, diagnostic, readme}, {"0.4.0"})
+        self.assertEqual({control, tweak, diagnostic, readme}, {"0.4.1"})
 
 
 if __name__ == "__main__":
