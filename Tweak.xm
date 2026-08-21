@@ -201,9 +201,9 @@ static BOOL DSHookInstanceMethod(Class targetClass, SEL selector, IMP replacemen
         [self clearPendingConversationID:conversationID messageID:pendingMessageID];
         return;
     }
-    if (!conversation.directConversation) {
+    if (!conversation.directConversation && !conversation.groupConversation) {
         [self clearPendingConversationID:conversationID messageID:pendingMessageID];
-        NSLog(@"[DouyinDeepSeek] skip non-direct conversation %@", conversationID);
+        NSLog(@"[DouyinDeepSeek] skip unsupported conversation %@", conversationID);
         return;
     }
     if ([self.busyConversationIDs containsObject:conversationID]) return;
@@ -364,7 +364,7 @@ static id DSNewSectionDataArray(id self, SEL _cmd) {
     id item = [[itemClass alloc] init];
     DSSetObjectSettingValue(item, @"setIdentifier:", @"DouyinDeepSeek");
     DSSetObjectSettingValue(item, @"setTitle:", @"DeepSeek AI");
-    DSSetObjectSettingValue(item, @"setDetail:", @"0.3.0");
+    DSSetObjectSettingValue(item, @"setDetail:", @"0.4.0");
     DSSetIntegerSettingValue(item, @"setType:", 0);
     DSSetObjectSettingValue(item, @"setSvgIconImageName:", @"ic_module_outlined_20");
     DSSetIntegerSettingValue(item, @"setCellType:", 26);

@@ -62,7 +62,37 @@ class ReleaseContracts(unittest.TestCase):
         self.assertIn("getMessagesInConversation:limit:", bridge)
         self.assertIn("hydrateConversation:conversation", tweak)
         self.assertIn("!fresh.historyHydrated", tweak)
-        self.assertIn("skip non-direct conversation", tweak)
+        self.assertIn("skip unsupported conversation", tweak)
+
+    def test_group_chat_keeps_each_sender_identity(self):
+        header = read("Sources/DSRuntimeBridge.h")
+        bridge = read("Sources/DSRuntimeBridge.m")
+        tweak = read("Tweak.xm")
+        settings = read("Sources/DSSettingsViewController.m")
+        self.assertIn("senderID", header)
+        self.assertIn("senderName", header)
+        self.assertIn("groupConversation", header)
+        self.assertIn("isGroupConversationObject", bridge)
+        self.assertIn('senderProfile.senderNickName', bridge)
+        self.assertIn('participantsMap', bridge)
+        self.assertIn('@"0:2:"', bridge)
+        self.assertIn("群成员(%@)", bridge)
+        self.assertIn("绝不能把不同成员混成一个人", bridge)
+        self.assertIn("当前需要回复的主要对象", bridge)
+        self.assertIn("conversation.directConversation && !conversation.groupConversation", tweak)
+        self.assertNotIn("暂不支持群聊", settings)
+
+    def test_group_context_labels_and_sender_merge(self):
+        bridge = read("Sources/DSRuntimeBridge.m")
+        snapshots = method_body(bridge, "- (NSArray<DSMessageSnapshot *> *)messageSnapshotsFromRawMessages", "- (NSArray<DSMessageSnapshot *> *)mergeMessages")
+        merge = method_body(bridge, "- (NSArray<DSMessageSnapshot *> *)mergeMessages", "- (BOOL)isDirectConversationObject")
+        context = method_body(bridge, "- (NSArray<NSDictionary", "- (BOOL)sendTextThroughYuki")
+        self.assertIn("senderIDFromObject", snapshots)
+        self.assertIn("senderNameFromObject", snapshots)
+        self.assertIn("old.senderID", merge)
+        self.assertIn("old.senderName", merge)
+        self.assertIn("speakerForMessage", context)
+        self.assertIn('conversation.groupConversation ? @"群聊" : @"私聊"', context)
 
     def test_cooldown_has_wakeup_and_retry_limit(self):
         tweak = read("Tweak.xm")
@@ -99,7 +129,7 @@ class ReleaseContracts(unittest.TestCase):
         tweak = re.search(r'setDetail:\", @\"([^\"]+)', read("Tweak.xm")).group(1)
         diagnostic = re.search(r"插件版本：([^\\]+)\\n", read("Sources/DSRuntimeBridge.m")).group(1)
         readme = re.search(r"^##\s+([^\s]+)", read("README.md"), re.M).group(1)
-        self.assertEqual({control, tweak, diagnostic, readme}, {"0.3.0"})
+        self.assertEqual({control, tweak, diagnostic, readme}, {"0.4.0"})
 
 
 if __name__ == "__main__":

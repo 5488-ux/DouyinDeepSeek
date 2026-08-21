@@ -48,9 +48,9 @@ typedef NS_ENUM(NSInteger, DSSettingsSection) {
 }
 
 - (NSString *)tableView:(UITableView *)tableView titleForFooterInSection:(NSInteger)section {
-    if (section == DSSettingsSectionMaster) return @"监听全局新私信；即使没有进入聊天框，也会先从抖音本地消息库加载该会话历史，再结合上下文回复。";
-    if (section == DSSettingsSectionReply) return @"每条上下文都会明确标注“谁说的”。我的称呼代表账号主人；联系人名称自动取当前抖音昵称。图片、语音等非文本消息暂不送给模型。";
-    if (section == DSSettingsSectionTest) return @"测试发话会在后台加载选中联系人的历史、生成并交给抖音发信接口，不再要求先打开目标聊天。";
+    if (section == DSSettingsSectionMaster) return @"监听全局私聊和群聊新消息；即使没有进入聊天框，也会先从抖音本地消息库加载该会话历史，再结合上下文回复。";
+    if (section == DSSettingsSectionReply) return @"私聊标注双方身份；群聊按每条消息的发送者 ID/昵称分别标注，并明确最新触发者。图片、语音等非文本消息暂不送给模型。";
+    if (section == DSSettingsSectionTest) return @"测试发话可选择私聊或群聊，在后台加载历史、生成并交给抖音发信接口，不要求先打开目标聊天。";
     return nil;
 }
 
@@ -116,7 +116,7 @@ typedef NS_ENUM(NSInteger, DSSettingsSection) {
             cell.detailTextLabel.text = [NSString stringWithFormat:@"%.0f 秒", config.cooldown];
         } else {
             cell.textLabel.text = @"上下文规则";
-            cell.detailTextLabel.text = @"每句标注：我的称呼/联系人昵称";
+            cell.detailTextLabel.text = @"私聊分双方；群聊分每个成员";
             cell.selectionStyle = UITableViewCellSelectionStyleNone;
             cell.accessoryType = UITableViewCellAccessoryNone;
         }
@@ -126,7 +126,7 @@ typedef NS_ENUM(NSInteger, DSSettingsSection) {
             cell.detailTextLabel.text = @"真实请求";
         } else if (indexPath.row == 1) {
             cell.textLabel.text = @"测试发话";
-            cell.detailTextLabel.text = @"选联系人→读上下文→生成→发送";
+            cell.detailTextLabel.text = @"选私聊/群聊→读上下文→生成→发送";
         } else if (indexPath.row == 2) {
             cell.textLabel.text = @"复制运行报错";
             cell.detailTextLabel.text = @"发送路线、对象类型、异常记录";
@@ -234,9 +234,9 @@ typedef NS_ENUM(NSInteger, DSSettingsSection) {
             [self showResultTitle:@"上下文加载失败" message:hydrateError.localizedDescription ?: @"抖音本地消息库没有返回历史，已停止生成。"];
             return;
         }
-        if (!fresh.directConversation) {
+        if (!fresh.directConversation && !fresh.groupConversation) {
             [self setBusy:NO title:nil];
-            [self showResultTitle:@"暂不支持群聊" message:@"自动回复当前只处理一对一私信，避免把群里不同的人混成一个联系人。"];
+            [self showResultTitle:@"暂不支持该会话" message:@"未识别为一对一私聊或群聊，为防止发错位置已停止。"];
             return;
         }
         NSArray *messages = [[DSRuntimeBridge shared] apiMessagesForConversation:fresh];

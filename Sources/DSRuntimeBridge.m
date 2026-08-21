@@ -233,9 +233,41 @@ static id DSUnwrappedConversation(id conversation) {
     NSString *name = DSStringValue(DSSafeValue(object, @[
         @"peerUser.nickname", @"peerUserViewModel.nickname", @"senderProfile.nickname",
         @"user.nickname", @"imUser.nickname", @"conversation.peerUser.nickname",
-        @"conversation.conversationName", @"displayName", @"nickname", @"nickName", @"name"
+        @"conversation.conversationName", @"conversation.groupChatName", @"conversation.groupName",
+        @"groupChatName", @"groupName", @"conversationName", @"displayName", @"nickname", @"nickName", @"name"
     ]));
     return [name stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+}
+
+- (NSString *)senderIDFromObject:(id)object direction:(DSMessageDirection)direction {
+    NSString *senderID = DSStringValue(DSSafeValue(object, @[
+        @"senderID", @"senderId", @"sender", @"fromUid", @"fromUserID", @"fromUserId", @"msg_sender",
+        @"sender.uid", @"sender.userID", @"sender.userId", @"senderProfile.uid", @"senderProfile.userID",
+        @"user.uid", @"user.userID", @"iesMessage.senderID", @"iesMessage.senderId", @"iesMessage.sender",
+        @"iesMessage.fromUid", @"iesMessage.fromUserID", @"iesMessage.sender.uid", @"message.senderID",
+        @"message.senderId", @"message.sender", @"localExt.sender_id", @"localExt.sender_uid",
+        @"ext.sender_id", @"ext.sender_uid", @"extra.sender_id", @"extra.sender_uid"
+    ]));
+    senderID = [senderID stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+    if (!senderID.length && direction == DSMessageDirectionOutgoing) {
+        int64_t currentUser = 0;
+        if ([self currentUserID:&currentUser]) senderID = [NSString stringWithFormat:@"%lld", currentUser];
+    }
+    return senderID ?: @"";
+}
+
+- (NSString *)senderNameFromObject:(id)object {
+    NSString *name = DSStringValue(DSSafeValue(object, @[
+        @"senderNickname", @"senderNickName", @"senderName", @"fromNickname", @"fromNickName", @"fromName",
+        @"sender.nickname", @"sender.nickName", @"sender.displayName", @"sender.name",
+        @"senderProfile.senderNickName", @"senderProfile.nickname", @"senderProfile.nickName", @"senderProfile.displayName",
+        @"senderProfile.basicExtInfo.group_alias", @"senderProfile.basicExtInfo.nickname", @"senderProfile.basicExtInfo.nick_name",
+        @"fromUser.nickname", @"fromUser.nickName", @"fromUser.displayName",
+        @"user.nickname", @"user.nickName", @"iesMessage.senderProfile.senderNickName", @"iesMessage.senderNickname", @"iesMessage.senderName",
+        @"message.senderProfile.senderNickName", @"message.senderNickname", @"message.senderName", @"localExt.sender_nickname", @"localExt.sender_name",
+        @"ext.sender_nickname", @"ext.sender_name", @"extra.sender_nickname", @"extra.sender_name"
+    ]));
+    return [name stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet] ?: @"";
 }
 
 - (NSString *)messageTextFromObject:(id)object {
@@ -360,6 +392,8 @@ static id DSUnwrappedConversation(id conversation) {
         DSMessageSnapshot *message = [[DSMessageSnapshot alloc] init];
         message.text = text;
         message.direction = [self messageDirectionFromObject:raw];
+        message.senderID = [self senderIDFromObject:raw direction:message.direction];
+        message.senderName = [self senderNameFromObject:raw];
         message.timestamp = [self messageTimestamp:raw fallback:now + index / 1000.0];
         NSString *fallback = [NSString stringWithFormat:@"%@-%.3f-%lu-%ld",
                               conversationID, message.timestamp,
@@ -387,6 +421,8 @@ static id DSUnwrappedConversation(id conversation) {
         if (old.direction == DSMessageDirectionUnknown && message.direction != DSMessageDirectionUnknown) {
             old.direction = message.direction;
         }
+        if (!old.senderID.length && message.senderID.length) old.senderID = message.senderID;
+        if (!old.senderName.length && message.senderName.length) old.senderName = message.senderName;
         if (old.timestamp <= 0 && message.timestamp > 0) old.timestamp = message.timestamp;
     }
     NSMutableArray<DSMessageSnapshot *> *result = [byID.allValues mutableCopy];
@@ -406,6 +442,55 @@ static id DSUnwrappedConversation(id conversation) {
     BOOL direct = DSBoolValue(DSUnwrappedConversation(conversation), @[@"is1to1Chat"], &found);
     if (found) return direct;
     return [conversationID hasPrefix:@"0:1:"];
+}
+
+- (BOOL)isGroupConversationObject:(id)conversation conversationID:(NSString *)conversationID {
+    id unwrapped = DSUnwrappedConversation(conversation);
+    BOOL found = NO;
+    BOOL group = DSBoolValue(unwrapped, @[
+        @"isGroupChat", @"isGroupConversation", @"isGroup", @"groupChat", @"isMultiChat", @"isMultiConversation"
+    ], &found);
+    if (found) return group;
+    if ([conversationID hasPrefix:@"0:2:"]) return YES;
+
+    int64_t type = 0;
+    if (DSIntegerValue(unwrapped, @"conversationType", &type)) return type == 2;
+    return NO;
+}
+
+- (NSDictionary<NSString *, NSString *> *)participantNamesFromConversation:(id)conversation {
+    id unwrapped = DSUnwrappedConversation(conversation);
+    if (!unwrapped) return @{};
+
+    NSMutableArray *participants = [NSMutableArray array];
+    id mapValue = DSSafeValue(unwrapped, @[@"participantsMap"]);
+    if ([mapValue isKindOfClass:NSDictionary.class]) [participants addObjectsFromArray:[mapValue allValues]];
+    [participants addObjectsFromArray:DSArrayValue(unwrapped, @[
+        @"participants", @"someParticipants", @"firstPageParticipants"
+    ])];
+
+    NSMutableDictionary<NSString *, NSString *> *names = [NSMutableDictionary dictionary];
+    for (id participant in participants) {
+        NSString *userID = DSStringValue(DSSafeValue(participant, @[
+            @"userID", @"userId", @"uid", @"user.uid", @"user.userID"
+        ]));
+        NSString *name = DSStringValue(DSSafeValue(participant, @[
+            @"alias", @"nickname", @"nickName", @"displayName", @"userNickName",
+            @"user.nickname", @"user.nickName", @"profile.nickname", @"profile.userNickName"
+        ]));
+        userID = [userID stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+        name = [name stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+        if (userID.length && name.length) names[userID] = name;
+    }
+    return names;
+}
+
+- (void)enrichSenderNamesInMessages:(NSArray<DSMessageSnapshot *> *)messages conversation:(id)conversation {
+    NSDictionary<NSString *, NSString *> *names = [self participantNamesFromConversation:conversation];
+    if (!names.count) return;
+    for (DSMessageSnapshot *message in messages) {
+        if (!message.senderName.length && message.senderID.length) message.senderName = names[message.senderID] ?: @"";
+    }
 }
 
 - (DSConversationSnapshot *)captureMessageController:(id)controller {
@@ -439,6 +524,7 @@ static id DSUnwrappedConversation(id conversation) {
     if (!displayName.length) displayName = conversationID;
 
     NSArray<DSMessageSnapshot *> *messages = [self messageSnapshotsFromRawMessages:rawMessages conversationID:conversationID];
+    [self enrichSenderNamesInMessages:messages conversation:conversation];
 
     DSConversationSnapshot *snapshot;
     @synchronized (self.conversations) {
@@ -453,8 +539,13 @@ static id DSUnwrappedConversation(id conversation) {
         if (conversation) {
             snapshot.conversationObject = DSUnwrappedConversation(conversation);
             snapshot.directConversation = [self isDirectConversationObject:conversation conversationID:conversationID];
+            snapshot.groupConversation = [self isGroupConversationObject:conversation conversationID:conversationID];
         } else if ([conversationID hasPrefix:@"0:1:"]) {
             snapshot.directConversation = YES;
+            snapshot.groupConversation = NO;
+        } else if ([conversationID hasPrefix:@"0:2:"]) {
+            snapshot.directConversation = NO;
+            snapshot.groupConversation = YES;
         }
         self.conversations[conversationID] = snapshot;
     }
@@ -523,6 +614,10 @@ static id DSUnwrappedConversation(id conversation) {
                 if (duplicate.direction == DSMessageDirectionUnknown && direction != DSMessageDirectionUnknown) {
                     duplicate.direction = direction;
                 }
+                NSString *senderID = [self senderIDFromObject:raw direction:direction];
+                NSString *senderName = [self senderNameFromObject:raw];
+                if (!duplicate.senderID.length && senderID.length) duplicate.senderID = senderID;
+                if (!duplicate.senderName.length && senderName.length) duplicate.senderName = senderName;
                 return;
             }
 
@@ -530,6 +625,8 @@ static id DSUnwrappedConversation(id conversation) {
             message.messageID = messageID;
             message.text = text;
             message.direction = direction;
+            message.senderID = [self senderIDFromObject:raw direction:direction];
+            message.senderName = [self senderNameFromObject:raw];
             message.timestamp = [self messageTimestamp:raw fallback:now + index / 1000.0];
             NSString *recentText = self.recentOutgoingTexts[conversationID];
             NSDate *recentDate = self.recentOutgoingDates[conversationID];
@@ -555,9 +652,21 @@ static id DSUnwrappedConversation(id conversation) {
             if (conversation) {
                 snapshot.conversationObject = DSUnwrappedConversation(conversation);
                 snapshot.directConversation = [self isDirectConversationObject:conversation conversationID:conversationID];
+                snapshot.groupConversation = [self isGroupConversationObject:conversation conversationID:conversationID];
             } else if ([conversationID hasPrefix:@"0:1:"]) {
                 snapshot.directConversation = YES;
+                snapshot.groupConversation = NO;
+            } else if ([conversationID hasPrefix:@"0:2:"]) {
+                snapshot.directConversation = NO;
+                snapshot.groupConversation = YES;
+            } else {
+                int64_t conversationType = 0;
+                if (DSIntegerValue(raw, @"conversationType", &conversationType)) {
+                    snapshot.directConversation = conversationType == 1;
+                    snapshot.groupConversation = conversationType == 2;
+                }
             }
+            [self enrichSenderNamesInMessages:snapshot.messages conversation:conversation];
             NSString *displayName = [self displayNameFromObject:conversation];
             if (!displayName.length) displayName = [self displayNameFromObject:raw];
             if (displayName.length) snapshot.displayName = displayName;
@@ -661,13 +770,23 @@ static id DSUnwrappedConversation(id conversation) {
         id sdkConversation = DSUnwrappedConversation(fetchedConversation ?: conversation.conversationObject);
         NSArray *rawHistory = [self historyMessagesFromConversationID:conversationID limit:[DSConfig shared].contextLimit];
         NSArray<DSMessageSnapshot *> *history = [self messageSnapshotsFromRawMessages:rawHistory conversationID:conversationID];
+        [self enrichSenderNamesInMessages:history conversation:sdkConversation];
         DSConversationSnapshot *snapshot = nil;
         @synchronized (self.conversations) {
             snapshot = self.conversations[conversationID] ?: conversation;
             snapshot.conversationID = conversationID;
             snapshot.messages = [self mergeMessages:history existing:snapshot.messages];
             if (sdkConversation) snapshot.conversationObject = sdkConversation;
-            snapshot.directConversation = [self isDirectConversationObject:sdkConversation conversationID:conversationID];
+            if (sdkConversation) {
+                snapshot.directConversation = [self isDirectConversationObject:sdkConversation conversationID:conversationID];
+                snapshot.groupConversation = [self isGroupConversationObject:sdkConversation conversationID:conversationID];
+            } else if ([conversationID hasPrefix:@"0:1:"]) {
+                snapshot.directConversation = YES;
+                snapshot.groupConversation = NO;
+            } else if ([conversationID hasPrefix:@"0:2:"]) {
+                snapshot.directConversation = NO;
+                snapshot.groupConversation = YES;
+            }
             snapshot.historyHydrated = rawHistory.count > 0 || snapshot.historyHydrated;
             self.conversations[conversationID] = snapshot;
         }
@@ -713,24 +832,43 @@ static id DSUnwrappedConversation(id conversation) {
     NSMutableArray *result = [NSMutableArray array];
     NSString *ownerName = config.ownerName.length ? config.ownerName : @"我";
     NSString *contactName = conversation.displayName.length ? conversation.displayName : @"对方";
-    NSString *identityInstruction = [NSString stringWithFormat:
-        @"这是账号主人“%@”与联系人“%@”的一对一私信。历史记录中，role=assistant 和【%@说】都表示账号主人本人此前发送的内容，不代表模型自己说过；role=user 和【%@说】都表示联系人发来的内容。你现在必须站在“%@”的身份，结合双方完整上下文，生成下一条发给“%@”的回复。要明确区分双方，不能把联系人说的话当成账号主人说的，也不能遗漏账号主人此前说过的话。账号主人的口吻要求：%@。只输出回复正文。",
-        ownerName, contactName, ownerName, contactName, ownerName, contactName, config.systemPrompt];
+    DSMessageSnapshot *latestIncoming = nil;
+    for (DSMessageSnapshot *message in all.reverseObjectEnumerator) {
+        if (message.direction == DSMessageDirectionIncoming) { latestIncoming = message; break; }
+    }
+    NSString *(^speakerForMessage)(DSMessageSnapshot *) = ^NSString *(DSMessageSnapshot *message) {
+        if (message.direction == DSMessageDirectionOutgoing) return ownerName;
+        if (!conversation.groupConversation) return contactName;
+        if (message.senderName.length) return message.senderName;
+        if (message.senderID.length) return [NSString stringWithFormat:@"群成员(%@)", message.senderID];
+        return @"群成员(身份未知)";
+    };
+    NSString *triggerName = latestIncoming ? speakerForMessage(latestIncoming) : @"最新发言成员";
+    NSString *identityInstruction = nil;
+    if (conversation.groupConversation) {
+        identityInstruction = [NSString stringWithFormat:
+            @"这是群聊“%@”。账号主人是“%@”，你必须始终站在“%@”的身份发言。历史记录中 role=assistant 和【%@说】表示账号主人本人发出的内容；role=user 表示其他群成员发言，每句前的【姓名说】或【群成员(ID)说】是该句真实发送者，绝不能把不同成员混成一个人。当前需要回复的主要对象是“%@”，但回复会发送到整个群聊；请结合全群上下文自然回应，必要时直接称呼对方，不能声称其他成员说过账号主人说的话。账号主人的口吻要求：%@。只输出要发到群里的回复正文。",
+            contactName, ownerName, ownerName, ownerName, triggerName, config.systemPrompt];
+    } else {
+        identityInstruction = [NSString stringWithFormat:
+            @"这是账号主人“%@”与联系人“%@”的一对一私信。历史记录中，role=assistant 和【%@说】都表示账号主人本人此前发送的内容，不代表模型自己说过；role=user 和【%@说】都表示联系人发来的内容。你现在必须站在“%@”的身份，结合双方完整上下文，生成下一条发给“%@”的回复。要明确区分双方，不能把联系人说的话当成账号主人说的，也不能遗漏账号主人此前说过的话。账号主人的口吻要求：%@。只输出回复正文。",
+            ownerName, contactName, ownerName, contactName, ownerName, contactName, config.systemPrompt];
+    }
     [result addObject:@{ @"role": @"system", @"content": identityInstruction }];
     for (NSUInteger i = start; i < all.count; i++) {
         DSMessageSnapshot *message = all[i];
         if (!message.text.length) continue;
         if (message.direction == DSMessageDirectionUnknown) continue;
         BOOL outgoing = message.direction == DSMessageDirectionOutgoing;
-        NSString *speaker = outgoing ? ownerName : contactName;
+        NSString *speaker = speakerForMessage(message);
         NSString *labeledText = [NSString stringWithFormat:@"【%@说】%@", speaker, message.text];
         [result addObject:@{
             @"role": outgoing ? @"assistant" : @"user",
             @"content": labeledText,
         }];
     }
-    [self recordDiagnostic:[NSString stringWithFormat:@"构建实名上下文：我=%@ 对方=%@ 历史文本=%lu API消息=%lu",
-                            ownerName, contactName,
+    [self recordDiagnostic:[NSString stringWithFormat:@"构建实名上下文：类型=%@ 我=%@ 目标=%@ 触发者=%@ 历史文本=%lu API消息=%lu",
+                            conversation.groupConversation ? @"群聊" : @"私聊", ownerName, contactName, triggerName,
                             (unsigned long)(all.count - start),
                             (unsigned long)result.count]];
     return result;
@@ -1153,9 +1291,14 @@ static id DSUnwrappedConversation(id conversation) {
     NSUInteger ownerMessageCount = 0;
     NSUInteger contactMessageCount = 0;
     NSUInteger unknownMessageCount = 0;
+    NSMutableSet<NSString *> *groupSenders = [NSMutableSet set];
     for (DSMessageSnapshot *message in conversation.messages) {
         if (message.direction == DSMessageDirectionOutgoing) ownerMessageCount++;
-        else if (message.direction == DSMessageDirectionIncoming) contactMessageCount++;
+        else if (message.direction == DSMessageDirectionIncoming) {
+            contactMessageCount++;
+            NSString *identity = message.senderID.length ? message.senderID : message.senderName;
+            if (identity.length) [groupSenders addObject:identity];
+        }
         else unknownMessageCount++;
     }
     NSArray<NSString *> *events;
@@ -1163,21 +1306,24 @@ static id DSUnwrappedConversation(id conversation) {
 
     NSMutableString *report = [NSMutableString string];
     [report appendString:@"DouyinDeepSeek 运行报错\n"];
-    [report appendString:@"插件版本：0.3.0\n"];
+    [report appendString:@"插件版本：0.4.0\n"];
     [report appendFormat:@"抖音版本：%@ (%@)\n", appVersion, appBuild];
     [report appendFormat:@"系统：iOS %@ / %@\n", UIDevice.currentDevice.systemVersion, UIDevice.currentDevice.model];
     [report appendFormat:@"兼容性：%@\n", [self compatibilitySummary]];
     [report appendFormat:@"已记录会话：%lu\n", (unsigned long)conversationCount];
     [report appendFormat:@"目标：%@ / %@\n", conversation.displayName ?: @"nil", conversation.conversationID ?: @"nil"];
     [report appendFormat:@"上下文文本：%lu\n", (unsigned long)conversation.messages.count];
-    [report appendFormat:@"身份映射：账号主人=%@ / 联系人=%@\n",
-     [DSConfig shared].ownerName ?: @"我", conversation.displayName ?: @"对方"];
-    [report appendFormat:@"身份统计：账号主人消息=%lu / 联系人消息=%lu / 方向未知=%lu\n",
-     (unsigned long)ownerMessageCount, (unsigned long)contactMessageCount, (unsigned long)unknownMessageCount];
-    [report appendFormat:@"后台能力：一对一=%@ / 历史已加载=%@ / 无需打开聊天框=%@\n",
+    [report appendFormat:@"会话类型：%@\n", conversation.groupConversation ? @"群聊" : (conversation.directConversation ? @"一对一私聊" : @"未识别")];
+    [report appendFormat:@"身份映射：账号主人=%@ / 会话=%@\n",
+     [DSConfig shared].ownerName ?: @"我", conversation.displayName ?: @"对方/群聊"];
+    [report appendFormat:@"身份统计：账号主人消息=%lu / 其他成员消息=%lu / 方向未知=%lu / 已识别成员=%lu\n",
+     (unsigned long)ownerMessageCount, (unsigned long)contactMessageCount, (unsigned long)unknownMessageCount,
+     (unsigned long)groupSenders.count];
+    [report appendFormat:@"后台能力：一对一=%@ / 群聊=%@ / 历史已加载=%@ / 无需打开聊天框=%@\n",
      conversation.directConversation ? @"✓" : @"✗",
+     conversation.groupConversation ? @"✓" : @"✗",
      conversation.historyHydrated ? @"✓" : @"✗",
-     (conversation.directConversation && conversation.historyHydrated) ? @"✓" : @"✗"];
+     ((conversation.directConversation || conversation.groupConversation) && conversation.historyHydrated) ? @"✓" : @"✗"];
     [report appendFormat:@"控制器：%@ / sendMessage:%@\n",
      controller ? NSStringFromClass([controller class]) : @"nil",
      [controller respondsToSelector:NSSelectorFromString(@"sendMessage:")] ? @"✓" : @"✗"];

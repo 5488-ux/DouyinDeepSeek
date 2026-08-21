@@ -12,6 +12,8 @@ typedef NS_ENUM(NSInteger, DSMessageDirection) {
 @interface DSMessageSnapshot : NSObject
 @property (nonatomic, copy) NSString *messageID;
 @property (nonatomic, copy) NSString *text;
+@property (nonatomic, copy) NSString *senderID;
+@property (nonatomic, copy) NSString *senderName;
 @property (nonatomic, assign) DSMessageDirection direction;
 @property (nonatomic, assign) NSTimeInterval timestamp;
 @end
@@ -23,6 +25,7 @@ typedef NS_ENUM(NSInteger, DSMessageDirection) {
 @property (nonatomic, weak, nullable) id controller;
 @property (nonatomic, strong, nullable) id conversationObject;
 @property (nonatomic, assign) BOOL directConversation;
+@property (nonatomic, assign) BOOL groupConversation;
 @property (nonatomic, assign) BOOL historyHydrated;
 @end
 
