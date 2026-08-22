@@ -3,11 +3,13 @@
 #import "DSDeepSeekClient.h"
 #import "DSRuntimeBridge.h"
 #import "DSConversationPickerViewController.h"
+#import "DSAISendLogViewController.h"
 
 typedef NS_ENUM(NSInteger, DSSettingsSection) {
     DSSettingsSectionMaster,
     DSSettingsSectionAPI,
     DSSettingsSectionReply,
+    DSSettingsSectionAudit,
     DSSettingsSectionTest,
     DSSettingsSectionCount,
 };
@@ -32,6 +34,7 @@ typedef NS_ENUM(NSInteger, DSSettingsSection) {
         case DSSettingsSectionMaster: return 2;
         case DSSettingsSectionAPI: return 5;
         case DSSettingsSectionReply: return 5;
+        case DSSettingsSectionAudit: return 1;
         case DSSettingsSectionTest: return 4;
         default: return 0;
     }
@@ -42,6 +45,7 @@ typedef NS_ENUM(NSInteger, DSSettingsSection) {
         case DSSettingsSectionMaster: return @"总开关";
         case DSSettingsSectionAPI: return @"DeepSeek API";
         case DSSettingsSectionReply: return @"上下文与回复";
+        case DSSettingsSectionAudit: return @"发送审计";
         case DSSettingsSectionTest: return @"测试与兼容性";
         default: return nil;
     }
@@ -50,6 +54,7 @@ typedef NS_ENUM(NSInteger, DSSettingsSection) {
 - (NSString *)tableView:(UITableView *)tableView titleForFooterInSection:(NSInteger)section {
     if (section == DSSettingsSectionMaster) return @"监听全局私聊和群聊新消息；即使没有进入聊天框，也会先从抖音本地消息库加载该会话历史，再结合上下文回复。";
     if (section == DSSettingsSectionReply) return @"私聊标注双方身份；群聊按每条消息的发送者 ID/昵称分别标注，并明确最新触发者。图片、语音等非文本消息暂不送给模型。";
+    if (section == DSSettingsSectionAudit) return @"“AI自动回复”只显示在本机日志里，发送给对方的聊天正文不会添加任何 AI 标记。最多保留最近 500 条。";
     if (section == DSSettingsSectionTest) return @"测试发话可选择私聊或群聊，在后台加载历史、生成并交给抖音发信接口，不要求先打开目标聊天。";
     return nil;
 }
@@ -120,6 +125,9 @@ typedef NS_ENUM(NSInteger, DSSettingsSection) {
             cell.selectionStyle = UITableViewCellSelectionStyleNone;
             cell.accessoryType = UITableViewCellAccessoryNone;
         }
+    } else if (indexPath.section == DSSettingsSectionAudit) {
+        cell.textLabel.text = @"AI发送记录";
+        cell.detailTextLabel.text = [NSString stringWithFormat:@"%lu 条", (unsigned long)[DSRuntimeBridge shared].aiSendRecords.count];
     } else if (indexPath.section == DSSettingsSectionTest) {
         if (indexPath.row == 0) {
             cell.textLabel.text = @"测试 DeepSeek API";
@@ -159,6 +167,9 @@ typedef NS_ENUM(NSInteger, DSSettingsSection) {
         else if (indexPath.row == 1) [self editTextSettingWithTitle:@"角色提示词" value:[DSConfig shared].systemPrompt placeholder:@"告诉模型如何代替你回复" secure:NO save:^(NSString *value) { [DSConfig shared].systemPrompt = value; }];
         else if (indexPath.row == 2) [self editIntegerSettingWithTitle:@"上下文条数" value:[DSConfig shared].contextLimit minimum:2 maximum:100 save:^(NSInteger value) { [DSConfig shared].contextLimit = value; }];
         else if (indexPath.row == 3) [self editIntegerSettingWithTitle:@"同会话冷却秒数" value:(NSInteger)[DSConfig shared].cooldown minimum:0 maximum:3600 save:^(NSInteger value) { [DSConfig shared].cooldown = value; }];
+    } else if (indexPath.section == DSSettingsSectionAudit) {
+        DSAISendLogViewController *logs = [[DSAISendLogViewController alloc] initWithStyle:UITableViewStyleInsetGrouped];
+        [self.navigationController pushViewController:logs animated:YES];
     } else if (indexPath.section == DSSettingsSectionTest) {
         if (indexPath.row == 0) [self testAPI];
         else if (indexPath.row == 1) [self chooseConversationForTest];

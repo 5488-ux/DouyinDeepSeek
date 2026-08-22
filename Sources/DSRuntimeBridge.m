@@ -4,6 +4,7 @@
 #import <objc/runtime.h>
 
 static NSString * const DSBridgeErrorDomain = @"com.codex.douyin.deepseek.bridge";
+static NSString * const DSAISendRecordsDefaultsKey = @"DouyinDeepSeek.aiSendRecords";
 
 @implementation DSMessageSnapshot
 @end
@@ -159,6 +160,7 @@ static id DSUnwrappedConversation(id conversation) {
 @property (nonatomic, strong) NSMutableDictionary<NSString *, NSString *> *captureSignatures;
 @property (nonatomic, strong) NSMutableSet<NSString *> *activeSendConversationIDs;
 @property (nonatomic, strong) NSMutableDictionary<NSString *, NSDate *> *completedSendOperations;
+@property (nonatomic, strong) NSMutableArray<NSMutableDictionary<NSString *, id> *> *storedAISendRecords;
 @property (nonatomic, strong) dispatch_queue_t stateQueue;
 @end
 
@@ -183,6 +185,19 @@ static id DSUnwrappedConversation(id conversation) {
         _captureSignatures = [NSMutableDictionary dictionary];
         _activeSendConversationIDs = [NSMutableSet set];
         _completedSendOperations = [NSMutableDictionary dictionary];
+        NSArray *savedRecords = [[NSUserDefaults standardUserDefaults] arrayForKey:DSAISendRecordsDefaultsKey];
+        _storedAISendRecords = [NSMutableArray array];
+        for (id item in [savedRecords isKindOfClass:NSArray.class] ? savedRecords : @[]) {
+            if (![item isKindOfClass:NSDictionary.class]) continue;
+            NSMutableDictionary *record = [item mutableCopy];
+            if ([record[@"status"] isEqualToString:@"发送中"]) {
+                record[@"status"] = @"运行中断，结果未知";
+                record[@"error"] = @"抖音在发信完成前退出，无法确认最终结果。";
+                record[@"updatedAt"] = @(NSDate.date.timeIntervalSince1970);
+            }
+            [_storedAISendRecords addObject:record];
+        }
+        [[NSUserDefaults standardUserDefaults] setObject:_storedAISendRecords forKey:DSAISendRecordsDefaultsKey];
         _stateQueue = dispatch_queue_create("com.codex.douyin.deepseek.bridge", DISPATCH_QUEUE_SERIAL);
         [self recordDiagnostic:@"插件运行桥初始化完成"];
     }
@@ -255,6 +270,61 @@ static id DSUnwrappedConversation(id conversation) {
         @"groupChatName", @"groupName", @"conversationName", @"displayName", @"nickname", @"nickName", @"name"
     ]));
     return [name stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+}
+
+- (void)persistAISendRecordsLocked {
+    while (self.storedAISendRecords.count > 500) [self.storedAISendRecords removeLastObject];
+    [[NSUserDefaults standardUserDefaults] setObject:self.storedAISendRecords forKey:DSAISendRecordsDefaultsKey];
+}
+
+- (void)recordAISendOperation:(NSString *)operationID
+                         text:(NSString *)text
+                 conversation:(DSConversationSnapshot *)conversation
+                       status:(NSString *)status
+                        error:(NSString *)error {
+    if (!operationID.length || !text.length || !conversation.conversationID.length) return;
+    @synchronized (self.storedAISendRecords) {
+        NSMutableDictionary *record = nil;
+        for (NSMutableDictionary *candidate in self.storedAISendRecords) {
+            if ([candidate[@"operationID"] isEqualToString:operationID]) { record = candidate; break; }
+        }
+        if (!record) {
+            record = [@{
+                @"operationID": operationID,
+                @"createdAt": @(NSDate.date.timeIntervalSince1970),
+                @"conversationID": conversation.conversationID,
+                @"displayName": conversation.displayName.length ? conversation.displayName : conversation.conversationID,
+                @"conversationType": conversation.groupConversation ? @"群聊" : @"私聊",
+                @"source": [operationID hasPrefix:@"auto:"] ? @"AI自动回复" : @"AI测试发话",
+                @"text": text,
+                @"status": status.length ? status : @"发送中",
+                @"updatedAt": @(NSDate.date.timeIntervalSince1970),
+            } mutableCopy];
+            [self.storedAISendRecords insertObject:record atIndex:0];
+        } else {
+            record[@"status"] = status.length ? status : @"发送中";
+            record[@"updatedAt"] = @(NSDate.date.timeIntervalSince1970);
+        }
+        if (error.length) record[@"error"] = error;
+        else [record removeObjectForKey:@"error"];
+        [self persistAISendRecordsLocked];
+    }
+}
+
+- (NSArray<NSDictionary<NSString *,id> *> *)aiSendRecords {
+    @synchronized (self.storedAISendRecords) {
+        NSMutableArray *copy = [NSMutableArray arrayWithCapacity:self.storedAISendRecords.count];
+        for (NSDictionary *record in self.storedAISendRecords) [copy addObject:[record copy]];
+        return copy;
+    }
+}
+
+- (void)clearAISendRecords {
+    @synchronized (self.storedAISendRecords) {
+        [self.storedAISendRecords removeAllObjects];
+        [[NSUserDefaults standardUserDefaults] removeObjectForKey:DSAISendRecordsDefaultsKey];
+    }
+    [self recordDiagnostic:@"已清空本机 AI 发送记录"];
 }
 
 - (NSString *)senderIDFromObject:(id)object direction:(DSMessageDirection)direction {
@@ -1061,6 +1131,7 @@ static id DSUnwrappedConversation(id conversation) {
         }
         [self.activeSendConversationIDs addObject:conversationID];
     }
+    [self recordAISendOperation:safeOperationID text:text conversation:conversation status:@"发送中" error:nil];
     __block BOOL didFinish = NO;
     void (^finish)(BOOL, NSError *) = ^(BOOL success, NSError *error) {
         if (didFinish) return;
@@ -1074,6 +1145,12 @@ static id DSUnwrappedConversation(id conversation) {
             }];
             [self.completedSendOperations removeObjectsForKeys:expired];
         }
+        NSString *status = success ? @"发送成功" : (error.code == -7 ? @"已调用，回执未确认" : @"发送失败");
+        [self recordAISendOperation:safeOperationID
+                               text:text
+                       conversation:conversation
+                             status:status
+                              error:error.localizedDescription];
         completion(success, error);
     };
     NSSet<NSString *> *baselineMessageIDs = [self messageIDsForConversationID:conversationID];
@@ -1308,6 +1385,7 @@ static id DSUnwrappedConversation(id conversation) {
 
     NSUInteger conversationCount = 0;
     @synchronized (self.conversations) { conversationCount = self.conversations.count; }
+    NSUInteger aiSendRecordCount = self.aiSendRecords.count;
     NSUInteger ownerMessageCount = 0;
     NSUInteger contactMessageCount = 0;
     NSUInteger unknownMessageCount = 0;
@@ -1326,11 +1404,12 @@ static id DSUnwrappedConversation(id conversation) {
 
     NSMutableString *report = [NSMutableString string];
     [report appendString:@"DouyinDeepSeek 运行报错\n"];
-    [report appendString:@"插件版本：0.4.1\n"];
+    [report appendString:@"插件版本：0.5.0\n"];
     [report appendFormat:@"抖音版本：%@ (%@)\n", appVersion, appBuild];
     [report appendFormat:@"系统：iOS %@ / %@\n", UIDevice.currentDevice.systemVersion, UIDevice.currentDevice.model];
     [report appendFormat:@"兼容性：%@\n", [self compatibilitySummary]];
     [report appendFormat:@"已记录会话：%lu\n", (unsigned long)conversationCount];
+    [report appendFormat:@"AI发送记录：%lu\n", (unsigned long)aiSendRecordCount];
     [report appendFormat:@"目标：%@ / %@\n", conversation.displayName ?: @"nil", conversation.conversationID ?: @"nil"];
     [report appendFormat:@"上下文文本：%lu\n", (unsigned long)conversation.messages.count];
     [report appendFormat:@"会话类型：%@\n", conversation.groupConversation ? @"群聊" : (conversation.directConversation ? @"一对一私聊" : @"未识别")];

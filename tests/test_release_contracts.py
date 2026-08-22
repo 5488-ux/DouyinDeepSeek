@@ -46,6 +46,28 @@ class ReleaseContracts(unittest.TestCase):
         context = method_body(bridge, "- (NSArray<NSDictionary", "- (BOOL)sendTextThroughYuki")
         self.assertIn("严禁输出或复制任何", context)
 
+    def test_ai_send_audit_is_local_and_never_changes_chat_text(self):
+        header = read("Sources/DSRuntimeBridge.h")
+        bridge = read("Sources/DSRuntimeBridge.m")
+        settings = read("Sources/DSSettingsViewController.m")
+        log_ui = read("Sources/DSAISendLogViewController.m")
+        makefile = read("Makefile")
+        self.assertIn("aiSendRecords", header)
+        self.assertIn("clearAISendRecords", header)
+        self.assertIn("DouyinDeepSeek.aiSendRecords", bridge)
+        self.assertIn("self.storedAISendRecords.count > 500", bridge)
+        self.assertIn('@"AI自动回复" : @"AI测试发话"', bridge)
+        send = method_body(bridge, "- (void)sendText:(NSString *)text\n  toConversation", "- (id)messageObjectForText")
+        self.assertIn("recordAISendOperation", send)
+        self.assertIn("invokeSendController:sender text:text", send)
+        self.assertNotIn("stringByAppendingString:@\"AI自动发送\"", send)
+        self.assertIn("DSSettingsSectionAudit", settings)
+        self.assertIn("AI发送记录", settings)
+        self.assertIn("复制全部记录", log_ui)
+        self.assertIn("清空全部记录", log_ui)
+        self.assertIn("不会添加任何“AI自动发送”字样", log_ui)
+        self.assertIn("Sources/DSAISendLogViewController.m", makefile)
+
     def test_direction_is_three_state_and_unknown_never_queues(self):
         header = read("Sources/DSRuntimeBridge.h")
         bridge = read("Sources/DSRuntimeBridge.m")
@@ -143,7 +165,7 @@ class ReleaseContracts(unittest.TestCase):
         tweak = re.search(r'setDetail:\", @\"([^\"]+)', read("Tweak.xm")).group(1)
         diagnostic = re.search(r"插件版本：([^\\]+)\\n", read("Sources/DSRuntimeBridge.m")).group(1)
         readme = re.search(r"^##\s+([^\s]+)", read("README.md"), re.M).group(1)
-        self.assertEqual({control, tweak, diagnostic, readme}, {"0.4.1"})
+        self.assertEqual({control, tweak, diagnostic, readme}, {"0.5.0"})
 
 
 if __name__ == "__main__":

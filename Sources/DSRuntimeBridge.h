@@ -49,6 +49,8 @@ typedef void (^DSHydrationCompletion)(DSConversationSnapshot * _Nullable convers
   toConversation:(DSConversationSnapshot *)conversation
       operationID:(NSString *)operationID
        completion:(DSSendCompletion)completion;
+- (NSArray<NSDictionary<NSString *, id> *> *)aiSendRecords;
+- (void)clearAISendRecords;
 - (NSString *)compatibilitySummary;
 - (NSString *)diagnosticReportForConversation:(nullable DSConversationSnapshot *)conversation;
 

@@ -11,6 +11,7 @@ DouyinDeepSeek_FILES = Tweak.xm \
 	Sources/DSDeepSeekClient.m \
 	Sources/DSRuntimeBridge.m \
 	Sources/DSConversationPickerViewController.m \
+	Sources/DSAISendLogViewController.m \
 	Sources/DSSettingsViewController.m
 DouyinDeepSeek_CFLAGS = -fobjc-arc -Wno-deprecated-declarations -Wno-unused-function
 DouyinDeepSeek_CCFLAGS = -std=c++17
